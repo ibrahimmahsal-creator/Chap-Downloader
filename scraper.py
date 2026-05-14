@@ -42,13 +42,14 @@ async def scrape_manhwa_images(url: str, output_dir: str):
             # الانتظار قليلاً لضمان تحميل الصور
             await page.wait_for_timeout(2000)
             
-            # استخراج الصور باستخدام جافاسكريبت لضمان دقة أعلى وتخطي مشاكل الـ CSS
+            # استنساخ خوارزمية (Imageye) لسحب جميع الصور الممكنة في الصفحة
             image_urls = await page.evaluate("""
                 () => {
                     let urls = [];
+                    
+                    // 1. استخراج كل صور <img>
                     let imgs = document.querySelectorAll('img');
                     for (let img of imgs) {
-                        // محاولة جلب الرابط الحقيقي (لتخطي الـ Lazy Loading)
                         let src = img.getAttribute('data-src') || 
                                   img.getAttribute('data-lazy-src') || 
                                   img.getAttribute('data-original') || 
@@ -56,26 +57,44 @@ async def scrape_manhwa_images(url: str, output_dir: str):
                                   
                         if (!src || src.startsWith('data:image')) continue;
                         
-                        // بعض المواقع تقطع المانهوا لشرائح صغيرة، لذلك سنقلل الحد الأدنى
-                        let isBig = (img.naturalWidth > 200 && img.naturalHeight > 150) || 
-                                    (img.width > 200 && img.height > 150);
-                                    
-                        // بعض المواقع تستخدم كلاسات محددة لصور الفصول
-                        let isChapterImg = img.className.includes('wp-manga') || 
-                                           img.className.includes('page-break') ||
-                                           img.className.includes('reader');
+                        let w = img.naturalWidth || img.width || img.clientWidth || 0;
+                        let h = img.naturalHeight || img.height || img.clientHeight || 0;
                         
-                        if (isBig || isChapterImg) {
-                            if (src.startsWith('http')) {
-                                urls.push(src);
-                            } else if (src.startsWith('//')) {
-                                urls.push(window.location.protocol + src);
-                            } else if (src.startsWith('/')) {
-                                urls.push(window.location.origin + src);
+                        // تجاهل الأيقونات (أقل من 100 بيكسل)
+                        if (w >= 100 && h >= 20) {
+                            urls.push(src);
+                        } else if (img.className.includes('wp-manga') || img.className.includes('page-break') || img.className.includes('reader')) {
+                            urls.push(src);
+                        }
+                    }
+                    
+                    // 2. استخراج صور خلفيات CSS (كما تفعل أداة Imageye)
+                    let allElements = document.querySelectorAll('*');
+                    for (let el of allElements) {
+                        let style = window.getComputedStyle(el);
+                        let bg = style.backgroundImage;
+                        if (bg && bg !== 'none' && bg.includes('url(')) {
+                            let match = bg.match(/url\(['"]?(.*?)['"]?\)/);
+                            if (match && match[1] && !match[1].startsWith('data:image')) {
+                                let w = el.clientWidth || 0;
+                                let h = el.clientHeight || 0;
+                                if (w >= 100 && h >= 20) {
+                                    urls.push(match[1]);
+                                }
                             }
                         }
                     }
-                    return [...new Set(urls)]; // إزالة التكرار
+                    
+                    // تنظيف وتحويل جميع الروابط لتكون كاملة
+                    let finalUrls = urls.map(src => {
+                        if (src.startsWith('http')) return src;
+                        if (src.startsWith('//')) return window.location.protocol + src;
+                        if (src.startsWith('/')) return window.location.origin + src;
+                        return window.location.origin + '/' + src;
+                    });
+                    
+                    // إزالة التكرارات مع الحفاظ على الترتيب
+                    return [...new Set(finalUrls)];
                 }
             """)
         except Exception as e:
