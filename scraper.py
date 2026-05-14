@@ -42,23 +42,42 @@ async def scrape_manhwa_images(url: str, output_dir: str):
             # الانتظار قليلاً لضمان تحميل الصور
             await page.wait_for_timeout(2000)
             
-            # استخراج الصور
-            images = await page.locator("img").all()
-            image_urls = []
-            
-            for img in images:
-                box = await img.bounding_box()
-                # الخوارزمية: الصورة يجب أن تكون كبيرة لتكون صفحة مانهوا
-                if box and box["width"] > 300 and box["height"] > 400:
-                    src = await img.get_attribute("src")
-                    if not src or "data:image" in src:
-                        # بعض المواقع تضع الرابط الحقيقي في data-src أو داتا مشابهة
-                        src = await img.get_attribute("data-src")
-                        if not src:
-                            src = await img.get_attribute("data-lazy-src")
-                    
-                    if src and src.startswith("http"):
-                        image_urls.append(src)
+            # استخراج الصور باستخدام جافاسكريبت لضمان دقة أعلى وتخطي مشاكل الـ CSS
+            image_urls = await page.evaluate("""
+                () => {
+                    let urls = [];
+                    let imgs = document.querySelectorAll('img');
+                    for (let img of imgs) {
+                        // محاولة جلب الرابط الحقيقي (لتخطي الـ Lazy Loading)
+                        let src = img.getAttribute('data-src') || 
+                                  img.getAttribute('data-lazy-src') || 
+                                  img.getAttribute('data-original') || 
+                                  img.src;
+                                  
+                        if (!src || src.startsWith('data:image')) continue;
+                        
+                        // بعض المواقع تقطع المانهوا لشرائح صغيرة، لذلك سنقلل الحد الأدنى
+                        let isBig = (img.naturalWidth > 200 && img.naturalHeight > 150) || 
+                                    (img.width > 200 && img.height > 150);
+                                    
+                        // بعض المواقع تستخدم كلاسات محددة لصور الفصول
+                        let isChapterImg = img.className.includes('wp-manga') || 
+                                           img.className.includes('page-break') ||
+                                           img.className.includes('reader');
+                        
+                        if (isBig || isChapterImg) {
+                            if (src.startsWith('http')) {
+                                urls.push(src);
+                            } else if (src.startsWith('//')) {
+                                urls.push(window.location.protocol + src);
+                            } else if (src.startsWith('/')) {
+                                urls.push(window.location.origin + src);
+                            }
+                        }
+                    }
+                    return [...new Set(urls)]; // إزالة التكرار
+                }
+            """)
         except Exception as e:
             print(f"Error while scraping page: {e}")
         finally:
