@@ -60,10 +60,17 @@ async def scrape_manhwa_images(url: str, output_dir: str):
                         let w = img.naturalWidth || img.width || img.clientWidth || 0;
                         let h = img.naturalHeight || img.height || img.clientHeight || 0;
                         
-                        // تجاهل الأيقونات (أقل من 100 بيكسل)
-                        if (w >= 100 && h >= 20) {
-                            urls.push(src);
-                        } else if (img.className.includes('wp-manga') || img.className.includes('page-break') || img.className.includes('reader')) {
+                        // المشكلة كانت في الـ Lazy Loading الذي يجعل الأبعاد 0. 
+                        // لذلك سنعتمد على اسم الكلاس أو مسار الرابط أيضاً!
+                        let isMangaImg = img.className.includes('wp-manga') || 
+                                         img.className.includes('page-break') ||
+                                         img.className.includes('reader') ||
+                                         img.className.includes('chapter-image') ||
+                                         src.includes('/chapter/') ||
+                                         src.includes('/manga/') ||
+                                         src.includes('/uploads/');
+                                         
+                        if (isMangaImg || (w >= 100 && h >= 20)) {
                             urls.push(src);
                         }
                     }
