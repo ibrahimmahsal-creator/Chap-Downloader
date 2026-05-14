@@ -128,7 +128,7 @@ async def on_ready():
 
 if __name__ == '__main__':
     # جلب التوكن من متغيرات البيئة (مهم جداً للسيرفرات مثل Render)
-    BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_DISCORD_TOKEN_HERE")
+    BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_DISCORD_TOKEN_HERE")
     
     if BOT_TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE" or not BOT_TOKEN:
         print("❌ يرجى تعيين BOT_TOKEN كمتغير بيئة (Environment Variable) أو وضعه في الكود مباشرة للتجربة المحلية!")
