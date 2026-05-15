@@ -260,144 +260,57 @@ _SHINIGAMI_UUID_RE = re.compile(
 
 async def _scrape_shinigami_api(url: str) -> tuple[list[str], dict, str]:
     """
-    Shinigami.asia stores chapter pages in a JSON API at:
-      GET https://shinigami.asia/api/chapter/<uuid>/images
-    Returns a list of image objects with a `url` (or `src`) field.
-    Falls back to scraping the __NEXT_DATA__ / window.__data__ JSON blob
-    embedded in the page's <script> tags if the API endpoint fails.
+    Uses the real Shinigami API discovered from the Tachiyomi extension source:
+      GET https://api.shngm.io/v1/chapter/detail/{chapter-id}
+      Images: https://storage.shngm.id{pageList.chapterPage.path}{imageName}
+
+    Required headers: Origin, DNT, Sec-GPC, Accept: application/json
     """
     m = _SHINIGAMI_UUID_RE.search(url)
     if not m:
         return [], {}, DEFAULT_UA
 
     chapter_id = m.group(1)
-    log.info(f"Shinigami.asia detected — chapter {chapter_id}")
+    log.info(f"Shinigami.asia detected — calling api.shngm.io for chapter {chapter_id}")
 
+    api_endpoint = f"https://api.shngm.io/v1/chapter/detail/{chapter_id}"
     headers = {
-        "User-Agent": DEFAULT_UA,
-        "Referer": url,
-        "Accept": "application/json, text/html, */*",
+        "User-Agent":      DEFAULT_UA,
+        "Accept":          "application/json",
+        "Origin":          "https://g.shinigami.asia",
+        "Referer":         "https://g.shinigami.asia/",
+        "DNT":             "1",
+        "Sec-GPC":         "1",
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    # ── Attempt 1: JSON API endpoint ────────────────────────────────────────
-    for api_tmpl in (
-        f"https://shinigami.asia/api/chapter/{chapter_id}/images",
-        f"https://shinigami.asia/api/chapters/{chapter_id}",
-    ):
-        try:
-            async with aiohttp.ClientSession(headers=headers) as session:
-                async with session.get(api_tmpl, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json(content_type=None)
-                        # data may be a list of URLs, list of objects, or a dict with an images key
-                        imgs = _extract_shinigami_urls(data, url)
-                        if imgs:
-                            log.info(f"Shinigami API ({api_tmpl}): {len(imgs)} pages")
-                            return imgs, {}, DEFAULT_UA
-        except Exception as exc:
-            log.debug(f"Shinigami API attempt failed ({api_tmpl}): {exc}")
-
-    # ── Attempt 2: parse __NEXT_DATA__ from raw HTML ─────────────────────
     try:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-        resp = scraper.get(url, timeout=20, headers={
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        })
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.content, "html.parser")
-
-        # Next.js embeds all page data in <script id="__NEXT_DATA__">
-        next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-        if next_data_tag and next_data_tag.string:
-            next_data = json.loads(next_data_tag.string)
-            imgs = _dig_for_image_urls(next_data, url)
-            if imgs:
-                log.info(f"Shinigami __NEXT_DATA__: {len(imgs)} pages")
-                return imgs, scraper.cookies.get_dict(), DEFAULT_UA
-
-        # Generic: scan all <script> tags for JSON arrays of image URLs
-        img_re = re.compile(
-            r'https?://[^\s\'"<>]+\.(?:jpg|jpeg|png|webp|gif|avif)(?:\?[^\s\'"<>]*)?',
-            re.IGNORECASE,
-        )
-        found: dict[str, None] = {}
-        for script in soup.find_all("script"):
-            for m2 in img_re.finditer(script.string or ""):
-                u = m2.group(0)
-                if not _is_ui_url(u):
-                    found[u] = None
-        if found:
-            log.info(f"Shinigami inline script: {len(found)} pages")
-            return list(found), scraper.cookies.get_dict(), DEFAULT_UA
-
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(api_endpoint, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                log.info(f"shngm.io API status: {resp.status}")
+                if resp.status != 200:
+                    log.warning(f"shngm.io API returned {resp.status}")
+                    return [], {}, DEFAULT_UA
+                data = await resp.json(content_type=None)
     except Exception as exc:
-        log.warning(f"Shinigami HTML fallback error: {exc}")
+        log.warning(f"shngm.io API error: {exc}")
+        return [], {}, DEFAULT_UA
 
-    log.warning(f"Shinigami: all methods failed for {url}")
-    return [], {}, DEFAULT_UA
+    try:
+        page_list    = data["pageList"]
+        chapter_page = page_list["chapterPage"]
+        path         = chapter_page["path"]       # e.g. "/manga/xxx/chapter-1/"
+        pages        = chapter_page["pages"]      # e.g. ["001.jpg", "002.jpg", ...]
+    except (KeyError, TypeError) as exc:
+        log.warning(f"shngm.io unexpected response shape: {exc} — raw: {str(data)[:300]}")
+        return [], {}, DEFAULT_UA
 
-
-def _extract_shinigami_urls(data, base_url: str) -> list[str]:
-    """Pull image URLs out of whatever shape the Shinigami API returns."""
-    urls: list[str] = []
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, str) and item.startswith("http"):
-                urls.append(item)
-            elif isinstance(item, dict):
-                for key in ("url", "src", "image", "imageUrl", "img"):
-                    val = item.get(key, "")
-                    if val and isinstance(val, str) and val.startswith("http"):
-                        urls.append(val)
-                        break
-    elif isinstance(data, dict):
-        # look for a nested list of pages
-        for key in ("images", "pages", "data", "chapter", "results"):
-            sub = data.get(key)
-            if sub:
-                urls = _extract_shinigami_urls(sub, base_url)
-                if urls:
-                    break
-    return urls
+    cdn = "https://storage.shngm.id"
+    image_urls = [f"{cdn}{path}{p}" for p in pages]
+    log.info(f"shngm.io API: {len(image_urls)} pages for chapter {chapter_id}")
+    return image_urls, {}, DEFAULT_UA
 
 
-def _dig_for_image_urls(obj, base_url: str, depth: int = 0) -> list[str]:
-    """Recursively search a parsed JSON object for arrays of image URLs."""
-    if depth > 12:
-        return []
-    img_re = re.compile(
-        r'https?://[^\s\'"<>]+\.(?:jpg|jpeg|png|webp|gif|avif)(?:\?[^\s\'"<>]*)?',
-        re.IGNORECASE,
-    )
-    if isinstance(obj, str):
-        if img_re.match(obj) and not _is_ui_url(obj):
-            return [obj]
-        return []
-    if isinstance(obj, list):
-        results: list[str] = []
-        for item in obj:
-            results.extend(_dig_for_image_urls(item, base_url, depth + 1))
-        if len(results) > 3:   # looks like a real page list
-            return results
-        return results
-    if isinstance(obj, dict):
-        # prioritise keys that sound like page/image lists
-        for key in ("images", "pages", "data", "dataSaver", "chapter", "results", "content"):
-            sub = obj.get(key)
-            if sub:
-                found = _dig_for_image_urls(sub, base_url, depth + 1)
-                if len(found) > 3:
-                    return found
-        # fall back to scanning all values
-        all_found: list[str] = []
-        for v in obj.values():
-            all_found.extend(_dig_for_image_urls(v, base_url, depth + 1))
-        return all_found
-    return []
 
 
 async def _scrape_mangadex_api(url: str) -> tuple[list[str], dict, str]:
