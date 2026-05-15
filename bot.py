@@ -247,18 +247,74 @@ async def _scrape_playwright(url: str) -> tuple[list[str], dict, str]:
         return [], {}, DEFAULT_UA
 
 
+_MANGADEX_UUID_RE = re.compile(
+    r'/chapter/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+    re.IGNORECASE,
+)
+
+
+async def _scrape_mangadex_api(url: str) -> tuple[list[str], dict, str]:
+    """
+    For URLs containing a MangaDex chapter UUID (e.g. shinigami.asia, mangadex.org,
+    or any scanlation site that re-uses MangaDex chapter IDs), fetch image URLs
+    directly from the MangaDex at-home API — no browser needed.
+    """
+    m = _MANGADEX_UUID_RE.search(url)
+    if not m:
+        return [], {}, DEFAULT_UA
+
+    chapter_id = m.group(1)
+    api_url    = f"https://api.mangadex.org/at-home/server/{chapter_id}"
+    log.info(f"Trying MangaDex at-home API for chapter {chapter_id}")
+
+    try:
+        async with aiohttp.ClientSession(headers={"User-Agent": DEFAULT_UA}) as session:
+            async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    log.warning(f"MangaDex API returned {resp.status}")
+                    return [], {}, DEFAULT_UA
+                data = await resp.json()
+    except Exception as exc:
+        log.warning(f"MangaDex API error: {exc}")
+        return [], {}, DEFAULT_UA
+
+    base_url   = data.get("baseUrl", "")
+    ch         = data.get("chapter", {})
+    hash_val   = ch.get("hash", "")
+    pages      = ch.get("data", [])          # high quality
+    if not pages:
+        pages  = ch.get("dataSaver", [])     # compressed fallback
+
+    if not base_url or not hash_val or not pages:
+        log.warning("MangaDex API response missing expected fields")
+        return [], {}, DEFAULT_UA
+
+    image_urls = [f"{base_url}/data/{hash_val}/{p}" for p in pages]
+    log.info(f"MangaDex API: found {len(image_urls)} pages")
+    return image_urls, {}, DEFAULT_UA
+
+
 async def _scrape_image_urls(url: str) -> tuple[list[str], dict, str]:
     """
-    Primary entry point for scraping.
-    1. Try fast static HTML scrape.
-    2. If nothing found, fall back to Playwright headless browser.
+    Scraping pipeline (fastest → slowest):
+    1. Static HTML scrape (cloudscraper + BeautifulSoup)  — ~1s
+    2. MangaDex at-home API (for any URL with a MangaDex UUID) — ~1s
+    3. Playwright headless browser subprocess              — ~20-55s
     """
+    # Step 1: static
     urls, cookies, ua = await asyncio.to_thread(_scrape_static, url)
     if urls:
         log.info(f"Static scrape found {len(urls)} image URL(s).")
         return urls, cookies, ua
-    # Static failed — JS-rendered page
+
+    # Step 2: MangaDex direct API
+    urls, cookies, ua = await _scrape_mangadex_api(url)
+    if urls:
+        return urls, cookies, ua
+
+    # Step 3: Playwright headless browser (last resort)
     return await _scrape_playwright(url)
+
 
 
 def _ext_from_content_type(ct: str, fallback_url: str) -> str:
