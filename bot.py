@@ -133,12 +133,39 @@ def _get_drive_service():
 
     # Support both: a file path  OR  the raw JSON string
     raw = GDRIVE_SERVICE_ACCOUNT.strip()
+
+    # ── Detect common mistakes before trying to open the value ──
+    if "apps.googleusercontent.com" in raw:
+        raise RuntimeError(
+            "GDRIVE_SERVICE_ACCOUNT_JSON contains a Google OAuth Client ID, not a Service Account JSON.\n\n"
+            "How to fix:\n"
+            "1. Go to console.cloud.google.com → your project\n"
+            "2. IAM & Admin → Service Accounts → Create Service Account\n"
+            "3. After creating it, click the account → Keys tab → Add Key → JSON\n"
+            "4. Download the .json file\n"
+            "5. In .env set: GDRIVE_SERVICE_ACCOUNT_JSON=C:/full/path/to/the/file.json\n"
+            "   (OR paste the entire JSON content as one line)"
+        )
+    if raw.endswith(".com") or raw.endswith(".net") or ("." in raw and "/" not in raw and not raw.startswith("{")):
+        raise RuntimeError(
+            f"GDRIVE_SERVICE_ACCOUNT_JSON looks like a domain/URL, not a file path or JSON.\n"
+            f"Got: '{raw[:80]}'\n"
+            "Set it to either:\n"
+            "  • The full path to your service account JSON file  (e.g. C:/keys/sa.json)\n"
+            "  • The entire JSON content starting with { on one line"
+        )
+
     if raw.startswith("{"):
         info = json.loads(raw)
         creds = service_account.Credentials.from_service_account_info(
             info, scopes=["https://www.googleapis.com/auth/drive"]
         )
     else:
+        if not os.path.isfile(raw):
+            raise RuntimeError(
+                f"Service account JSON file not found: '{raw}'\n"
+                "Make sure the path is correct and the file exists."
+            )
         creds = service_account.Credentials.from_service_account_file(
             raw, scopes=["https://www.googleapis.com/auth/drive"]
         )
