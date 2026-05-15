@@ -199,84 +199,140 @@ def _scrape_static(url: str) -> tuple[list[str], dict, str]:
 
 async def _scrape_playwright(url: str) -> tuple[list[str], dict, str]:
     """
-    JS-rendered fallback: launches headless Chromium via Playwright,
-    waits for the network to settle, then extracts image URLs from the live DOM.
-    Also intercepts image network requests to catch lazily-loaded images.
+    JS-rendered fallback: launches headless Chromium via Playwright.
+    Strategy:
+      1. Intercept ALL image requests (catches lazy-loaded images).
+      2. Intercept XHR/fetch JSON responses — many manhwa sites serve
+         image lists via API calls (e.g. Shinigami.asia).
+      3. Use wait_until='load' + fixed sleep (NOT networkidle — many
+         sites poll forever and networkidle never fires).
+      4. Scroll the page to trigger lazy-loading.
+      5. Hard 60-second cap via asyncio.wait_for so Discord never times out.
     """
     if not PLAYWRIGHT_AVAILABLE:
-        log.warning("Playwright not installed — JS fallback unavailable. Run: pip install playwright && playwright install chromium")
+        log.warning("Playwright not installed — JS fallback unavailable. Run: pip install playwright && python -m playwright install chromium")
         return [], {}, DEFAULT_UA
 
     log.info(f"Static scrape found nothing — trying Playwright JS fallback for {url}")
-    intercepted: dict[str, None] = {}
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    async def _run() -> tuple[list[str], dict, str]:
+        intercepted: dict[str, None] = {}   # image URLs seen in network traffic
+        json_images: dict[str, None] = {}   # image URLs extracted from JSON API responses
+
+        # ── helpers ──────────────────────────────────────────────────────────
+        _IMG_URL_RE = re.compile(
+            r'https?://[^\s\'"<>]+\.(?:jpg|jpeg|png|webp|gif|avif|bmp)(?:\?[^\s\'"<>]*)?',
+            re.IGNORECASE,
         )
-        context = await browser.new_context(
-            user_agent=DEFAULT_UA,
-            viewport={"width": 1280, "height": 900},
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-        )
-        page = await context.new_page()
 
-        # Intercept every image network request so we catch lazy-loaded ones
-        def _on_request(request):
-            if request.resource_type == "image":
-                img_url = request.url
-                if not _is_ui_url(img_url) and not img_url.startswith("data:"):
-                    parsed_path = urllib.parse.urlparse(img_url).path.lower()
-                    ext = os.path.splitext(parsed_path)[1]
-                    if ext == "" or ext in SUPPORTED_EXTS:
-                        intercepted[img_url] = None
+        def _register_img_url(img_url: str, store: dict):
+            if img_url.startswith("data:") or _is_ui_url(img_url):
+                return
+            parsed_path = urllib.parse.urlparse(img_url).path.lower()
+            ext = os.path.splitext(parsed_path)[1]
+            if ext == "" or ext in SUPPORTED_EXTS:
+                store[img_url] = None
 
-        page.on("request", _on_request)
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                      "--disable-blink-features=AutomationControlled"],
+            )
+            context = await browser.new_context(
+                user_agent=DEFAULT_UA,
+                viewport={"width": 1280, "height": 900},
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+            page = await context.new_page()
 
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=45_000)
-        except Exception as exc:
-            log.warning(f"Playwright goto error (continuing anyway): {exc}")
+            # 1. Intercept image requests
+            def _on_request(request):
+                if request.resource_type == "image":
+                    _register_img_url(request.url, intercepted)
 
-        # Scroll the page to trigger lazy-loading
-        try:
-            await page.evaluate("""
-                async () => {
-                    await new Promise(resolve => {
-                        let total = document.body.scrollHeight;
-                        let scrolled = 0;
-                        const step = Math.max(600, Math.floor(total / 20));
-                        const timer = setInterval(() => {
-                            window.scrollBy(0, step);
-                            scrolled += step;
-                            if (scrolled >= total) { clearInterval(timer); resolve(); }
-                        }, 120);
-                    });
-                }
-            """)
-            await asyncio.sleep(2)   # let lazy images fire
-        except Exception:
-            pass
+            page.on("request", _on_request)
 
-        # Parse the final live DOM
-        html  = await page.content()
-        soup  = BeautifulSoup(html, "html.parser")
-        dom_urls = _parse_soup_for_images(soup, url)
+            # 2. Intercept XHR/fetch JSON responses for API-served image lists
+            async def _on_response(response):
+                try:
+                    ct = response.headers.get("content-type", "")
+                    if "json" in ct or "javascript" in ct:
+                        text = await response.text()
+                        for match in _IMG_URL_RE.finditer(text):
+                            _register_img_url(match.group(0), json_images)
+                except Exception:
+                    pass
 
-        # Merge intercepted network image requests + DOM parse results
-        all_urls: dict[str, None] = {u: None for u in intercepted}
+            page.on("response", _on_response)
+
+            # 3. Navigate — use 'load' not 'networkidle' (polling sites never reach idle)
+            try:
+                await page.goto(url, wait_until="load", timeout=30_000)
+            except Exception as exc:
+                log.warning(f"Playwright goto error (continuing): {exc}")
+
+            # 4. Wait for JS to render images (fixed sleep — reliable unlike networkidle)
+            await asyncio.sleep(5)
+
+            # 5. Scroll to trigger lazy-loading, then wait for those requests
+            try:
+                await page.evaluate("""
+                    async () => {
+                        await new Promise(resolve => {
+                            const total = document.body.scrollHeight;
+                            let scrolled = 0;
+                            const step = Math.max(400, Math.floor(total / 15));
+                            const timer = setInterval(() => {
+                                window.scrollBy(0, step);
+                                scrolled += step;
+                                if (scrolled >= total) { clearInterval(timer); resolve(); }
+                            }, 150);
+                        });
+                    }
+                """)
+                await asyncio.sleep(3)   # let lazy image requests fire
+            except Exception:
+                pass
+
+            # 6. Parse final live DOM
+            html = await page.content()
+            soup = BeautifulSoup(html, "html.parser")
+            dom_urls = _parse_soup_for_images(soup, url)
+
+            # 7. Also scan all inline <script> tags for image URL patterns
+            for script in soup.find_all("script"):
+                text = script.string or ""
+                for match in _IMG_URL_RE.finditer(text):
+                    _register_img_url(match.group(0), json_images)
+
+            # 8. Collect cookies
+            raw_cookies = await context.cookies()
+            cookies = {c["name"]: c["value"] for c in raw_cookies}
+
+            await browser.close()
+
+        # Merge: JSON/API urls first (ordered), then network-intercepted, then DOM
+        all_urls: dict[str, None] = {}
+        for u in json_images:
+            all_urls[u] = None
+        for u in intercepted:
+            all_urls[u] = None
         for u in dom_urls:
             all_urls[u] = None
 
-        # Collect cookies for the download phase
-        raw_cookies = await context.cookies()
-        cookies = {c["name"]: c["value"] for c in raw_cookies}
+        log.info(
+            f"Playwright found {len(all_urls)} URL(s) "
+            f"[json_api={len(json_images)}, intercepted={len(intercepted)}, dom={len(dom_urls)}]"
+        )
+        return list(all_urls.keys()), cookies, DEFAULT_UA
 
-        await browser.close()
-
-    log.info(f"Playwright found {len(all_urls)} image URL(s) for {url}")
-    return list(all_urls.keys()), cookies, DEFAULT_UA
+    # Hard 60-second cap so Discord interaction never times out
+    try:
+        return await asyncio.wait_for(_run(), timeout=60)
+    except asyncio.TimeoutError:
+        log.warning(f"Playwright hard-timeout (60 s) reached for {url}")
+        return [], {}, DEFAULT_UA
 
 
 async def _scrape_image_urls(url: str) -> tuple[list[str], dict, str]:
