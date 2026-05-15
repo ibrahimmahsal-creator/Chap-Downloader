@@ -284,24 +284,32 @@ async def _scrape_shinigami_api(url: str) -> tuple[list[str], dict, str]:
         "Accept-Language": "en-US,en;q=0.9",
     }
 
+    def _debug_log(msg):
+        log.info(msg)
+        with open("shinigami_debug.txt", "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+
     try:
         def _fetch_api():
+            _debug_log(f"Attempting cloudscraper for {api_endpoint}")
             scraper = cloudscraper.create_scraper(
                 browser={"browser": "chrome", "platform": "windows", "mobile": False}
             )
             resp = scraper.get(api_endpoint, headers=headers, timeout=15)
+            _debug_log(f"cloudscraper returned status: {resp.status_code}")
             return resp
 
         resp = await asyncio.to_thread(_fetch_api)
-        log.info(f"shngm.io API status: {resp.status_code}")
+        _debug_log(f"shngm.io API status: {resp.status_code}")
         
         if resp.status_code != 200:
-            log.warning(f"shngm.io API returned {resp.status_code}")
+            _debug_log(f"shngm.io API returned {resp.status_code} - Body: {resp.text[:200]}")
             return [], {}, DEFAULT_UA
             
         data = resp.json()
+        _debug_log(f"Successfully parsed JSON. Keys: {list(data.keys())}")
     except Exception as exc:
-        log.warning(f"shngm.io API error: {exc}")
+        _debug_log(f"shngm.io API error: {exc}")
         return [], {}, DEFAULT_UA
 
     try:
@@ -314,6 +322,7 @@ async def _scrape_shinigami_api(url: str) -> tuple[list[str], dict, str]:
         pages = chapter_info.get("data", [])
         
         if not pages:
+            _debug_log("pages is empty, falling back to old Tachiyomi format")
             # Fallback to the old Tachiyomi extension structure just in case
             page_list = data.get("pageList", {})
             chapter_page = page_list.get("chapterPage", {})
@@ -322,15 +331,15 @@ async def _scrape_shinigami_api(url: str) -> tuple[list[str], dict, str]:
             base_url = "https://storage.shngm.id"
             
     except (KeyError, TypeError) as exc:
-        log.warning(f"shngm.io unexpected response shape: {exc} — raw: {str(data)[:300]}")
+        _debug_log(f"shngm.io unexpected response shape: {exc} — raw: {str(data)[:300]}")
         return [], {}, DEFAULT_UA
 
     if not pages:
-        log.warning("shngm.io API returned empty page list")
+        _debug_log("shngm.io API returned empty page list")
         return [], {}, DEFAULT_UA
 
     image_urls = [f"{base_url}{path}{p}" for p in pages]
-    log.info(f"shngm.io API: {len(image_urls)} pages for chapter {chapter_id}")
+    _debug_log(f"shngm.io API: {len(image_urls)} pages for chapter {chapter_id}")
     return image_urls, {}, DEFAULT_UA
 
 
