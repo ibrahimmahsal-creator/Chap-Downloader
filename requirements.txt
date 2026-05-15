@@ -1,6 +1,0 @@
-discord.py
-playwright
-aiohttp
-aiofiles
-PyDrive2
-nest_asyncio
