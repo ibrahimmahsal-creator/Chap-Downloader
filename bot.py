@@ -30,7 +30,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 MAX_IMAGES          = 300          # hard cap per request
 MAX_CONCURRENT_DL   = 20           # simultaneous downloads (semaphore)
 DOWNLOAD_TIMEOUT    = aiohttp.ClientTimeout(total=20, connect=8)
-DISCORD_SIZE_LIMIT  = 25 * 1024 * 1024   # 25 MB
+DISCORD_SIZE_LIMIT  = 10 * 1024 * 1024   # 10 MB
 MIN_IMAGE_BYTES     = 512          # ignore tiny tracker pixels / placeholders
 SUPPORTED_EXTS      = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.avif'}
 
