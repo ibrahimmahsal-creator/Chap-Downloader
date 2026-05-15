@@ -1,3 +1,4 @@
+import tempfile
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -111,57 +112,64 @@ async def download_images(interaction: discord.Interaction, url: str):
     # We will limit to 200 images max
     urls_to_download = list(image_urls)[:200]
     
-    async def fetch_image(session, index, img_url):
-        try:
-            async with session.get(img_url, timeout=15) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    content_type = response.headers.get('Content-Type', '')
-                    return index, img_url, content, content_type
-        except Exception as e:
-            print(f"Failed to download {img_url}: {e}")
-        return index, img_url, None, None
+    # Use a temporary directory to save files to the disk instead of RAM
+    with tempfile.TemporaryDirectory() as temp_dir:
+        
+        async def fetch_and_save(session, index, img_url):
+            try:
+                async with session.get(img_url, timeout=15) as response:
+                    if response.status == 200:
+                        content_type = response.headers.get('Content-Type', '')
+                        ext = '.jpg'
+                        if 'png' in content_type: ext = '.png'
+                        elif 'gif' in content_type: ext = '.gif'
+                        elif 'webp' in content_type: ext = '.webp'
+                        elif 'svg' in content_type: ext = '.svg'
+                        
+                        parsed = urllib.parse.urlparse(img_url)
+                        path_name = os.path.basename(parsed.path)
+                        filename = path_name if path_name and '.' in path_name else f"image_{index}{ext}"
+                        filename = f"{index:03d}_{filename}"
+                        filepath = os.path.join(temp_dir, filename)
+                        
+                        # Write the file to disk in chunks to save memory
+                        with open(filepath, 'wb') as f:
+                            async for chunk in response.content.iter_chunked(1024):
+                                f.write(chunk)
+                        return True
+            except Exception as e:
+                print(f"Failed to download {img_url}: {e}")
+            return False
 
-    # Download everything purely async using aiohttp and the Cloudflare cookies!
-    async with aiohttp.ClientSession(cookies=cookies, headers={'User-Agent': user_agent}) as session:
-        tasks = [fetch_image(session, i, u) for i, u in enumerate(urls_to_download)]
-        results = await asyncio.gather(*tasks)
+        # Download everything purely async and save to temp_dir
+        async with aiohttp.ClientSession(cookies=cookies, headers={'User-Agent': user_agent}) as session:
+            tasks = [fetch_and_save(session, i, u) for i, u in enumerate(urls_to_download)]
+            results = await asyncio.gather(*tasks)
 
-    # Now we write to zip synchronously
-    zip_buffer = io.BytesIO()
-    count = 0
-    with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
-        for index, img_url, content, content_type in results:
-            if content:
-                ext = '.jpg'
-                if 'png' in content_type: ext = '.png'
-                elif 'gif' in content_type: ext = '.gif'
-                elif 'webp' in content_type: ext = '.webp'
-                elif 'svg' in content_type: ext = '.svg'
-                
-                parsed = urllib.parse.urlparse(img_url)
-                path_name = os.path.basename(parsed.path)
-                if path_name and '.' in path_name:
-                    filename = path_name
-                else:
-                    filename = f"image_{index}{ext}"
-                    
-                filename = f"{index:03d}_{filename}"
-                zip_file.writestr(filename, content)
-                count += 1
-                
-    zip_buffer.seek(0)
-    
-    # Check size limit (Discord allows 25MB for regular users)
-    size_mb = len(zip_buffer.getvalue()) / (1024 * 1024)
-    
-    if count == 0:
-        await interaction.followup.send(f"⚠️ Failed to download any images from {url}. They might be protected or broken links.")
-    elif size_mb > 25:
-        await interaction.followup.send(f"⚠️ The zip file is too large ({size_mb:.2f} MB) to send directly. Discord's limit is 25MB. \n\nHowever, {count} images were successfully found.")
-    else:
-        file = discord.File(fp=zip_buffer, filename="extracted_images.zip")
-        await interaction.followup.send(f"✅ Successfully downloaded {count} images from {url}:", file=file)
+        # Count how many images successfully downloaded
+        count = sum(results)
+        
+        if count == 0:
+            await interaction.followup.send(f"⚠️ Failed to download any images from {url}. They might be protected or broken links.")
+            return
+
+        # Create the zip file directly on the disk
+        zip_path = os.path.join(temp_dir, "extracted_images.zip")
+        with zipfile.ZipFile(zip_path, 'w') as zip_file:
+            for root, _, files in os.walk(temp_dir):
+                for file in files:
+                    if file != "extracted_images.zip":
+                        zip_file.write(os.path.join(root, file), arcname=file)
+                        
+        # Check size limit (Discord allows 25MB for regular users)
+        size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+        
+        if size_mb > 25:
+            await interaction.followup.send(f"⚠️ The zip file is too large ({size_mb:.2f} MB) to send directly. Discord's limit is 25MB. \n\nHowever, {count} images were successfully scraped.")
+        else:
+            # Send the zip file from the disk
+            file = discord.File(fp=zip_path, filename="extracted_images.zip")
+            await interaction.followup.send(f"✅ Successfully downloaded {count} images from {url}:", file=file)
 
 if __name__ == "__main__":
     if not TOKEN or TOKEN == "your_discord_bot_token_here":
