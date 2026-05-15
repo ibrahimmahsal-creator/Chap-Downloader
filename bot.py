@@ -10,6 +10,7 @@ import re
 import os
 import threading
 import concurrent.futures
+import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
@@ -111,52 +112,48 @@ async def download_images(interaction: discord.Interaction, url: str):
     await interaction.followup.send(f"Found {len(image_urls)} images. Downloading concurrently and packing into a zip...")
     
     zip_buffer = io.BytesIO()
-    scraper = cloudscraper.create_scraper()
     
-    # We will limit to 200 images max
-    urls_to_download = list(image_urls)[:200]
-    
-    def fetch_image(data):
-        index, img_url = data
-        try:
-            # We use a slight longer timeout in case of concurrency bottlenecks
-            img_response = scraper.get(img_url, timeout=10)
-            if img_response.status_code == 200:
-                content_type = img_response.headers.get('content-type', '')
-                return index, img_url, img_response.content, content_type
-        except Exception as e:
-            print(f"Failed to download {img_url}: {e}")
-        return index, img_url, None, None
+    def download_all_images():
+        scraper = cloudscraper.create_scraper()
+        urls_to_download = list(image_urls)[:200]
+        
+        def fetch_image(data):
+            index, img_url = data
+            try:
+                img_response = scraper.get(img_url, timeout=10)
+                if img_response.status_code == 200:
+                    content_type = img_response.headers.get('content-type', '')
+                    return index, img_url, img_response.content, content_type
+            except Exception as e:
+                print(f"Failed to download {img_url}: {e}")
+            return index, img_url, None, None
 
-    with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
-        count = 0
-        # Use ThreadPoolExecutor to download 15 images at the same time
-        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-            # executor.map maintains the original order of URLs
-            results = executor.map(fetch_image, enumerate(urls_to_download))
-            
-            for index, img_url, content, content_type in results:
-                if content:
-                    # Guess extension from content type
-                    ext = '.jpg'
-                    if 'png' in content_type: ext = '.png'
-                    elif 'gif' in content_type: ext = '.gif'
-                    elif 'webp' in content_type: ext = '.webp'
-                    elif 'svg' in content_type: ext = '.svg'
-                    
-                    # Try to get original filename
-                    parsed = urllib.parse.urlparse(img_url)
-                    path_name = os.path.basename(parsed.path)
-                    if path_name and '.' in path_name:
-                        filename = path_name
-                    else:
-                        filename = f"image_{index}{ext}"
+        downloaded_count = 0
+        with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                results = executor.map(fetch_image, enumerate(urls_to_download))
+                for index, img_url, content, content_type in results:
+                    if content:
+                        ext = '.jpg'
+                        if 'png' in content_type: ext = '.png'
+                        elif 'gif' in content_type: ext = '.gif'
+                        elif 'webp' in content_type: ext = '.webp'
+                        elif 'svg' in content_type: ext = '.svg'
                         
-                    # Handle duplicate filenames in zip
-                    filename = f"{index:03d}_{filename}"
-                        
-                    zip_file.writestr(filename, content)
-                    count += 1
+                        parsed = urllib.parse.urlparse(img_url)
+                        path_name = os.path.basename(parsed.path)
+                        if path_name and '.' in path_name:
+                            filename = path_name
+                        else:
+                            filename = f"image_{index}{ext}"
+                            
+                        filename = f"{index:03d}_{filename}"
+                        zip_file.writestr(filename, content)
+                        downloaded_count += 1
+        return downloaded_count
+
+    # Run the blocking downloads in a background thread so we don't disconnect from Discord!
+    count = await asyncio.to_thread(download_all_images)
                 
     zip_buffer.seek(0)
     
