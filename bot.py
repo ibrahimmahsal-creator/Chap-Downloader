@@ -51,7 +51,7 @@ GDRIVE_SERVICE_ACCOUNT  = os.getenv("GDRIVE_SERVICE_ACCOUNT_JSON", "")  # JSON k
 MAX_IMAGES          = 300
 MAX_CONCURRENT_DL   = 20
 DOWNLOAD_TIMEOUT    = aiohttp.ClientTimeout(total=20, connect=8)
-DISCORD_SIZE_LIMIT  = 10 * 1024 * 1024   # 10 MB
+DISCORD_SIZE_LIMIT  = 300 * 1024 * 1024   # 100 MB
 MIN_IMAGE_BYTES     = 512
 SUPPORTED_EXTS      = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.avif'}
 
@@ -366,6 +366,93 @@ def _split_zip_if_needed(results, limit=DISCORD_SIZE_LIMIT):
     return [_build_zip(chunk) for chunk in chunks]
 
 
+def _smart_stitch(results, max_strip_height: int = 15000) -> tuple[io.BytesIO, int]:
+    """
+    Vertically stitch all manhwa panels into strips of at most max_strip_height px,
+    then pack those strips into a single ZIP.
+    Returns (zip_buffer, strip_count).
+    """
+    if not PIL_AVAILABLE:
+        raise RuntimeError(
+            "Pillow is required for Smart Stitch. Run: pip install Pillow"
+        )
+
+    # Sort by DOM index so panels are in reading order
+    sorted_items = sorted(
+        [(idx, url, data, ct) for idx, url, data, ct in results if data],
+        key=lambda x: x[0],
+    )
+
+    # Decode every image that passes the panel filter
+    pil_images: list[PILImage.Image] = []
+    for idx, url, data, ct in sorted_items:
+        if not _is_manhwa_panel(data, ct):
+            continue
+        try:
+            img = PILImage.open(io.BytesIO(data))
+            img.load()          # force full decode so we can close the BytesIO
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            pil_images.append(img)
+        except Exception as exc:
+            log.debug(f"Stitch: could not decode image — {exc}")
+
+    if not pil_images:
+        raise ValueError("No valid images to stitch after filtering.")
+
+    # Use the most common width as the target width
+    widths = [img.size[0] for img in pil_images]
+    target_w = max(set(widths), key=widths.count)
+
+    # Resize images that don't match the target width (keep aspect ratio)
+    scaled: list[PILImage.Image] = []
+    for img in pil_images:
+        if img.size[0] != target_w:
+            ratio = target_w / img.size[0]
+            new_h = max(1, int(img.size[1] * ratio))
+            img = img.resize((target_w, new_h), PILImage.LANCZOS)
+        scaled.append(img)
+
+    # Split into strips whose total height ≤ max_strip_height
+    strip_groups: list[list[PILImage.Image]] = []
+    current: list[PILImage.Image] = []
+    current_h = 0
+    for img in scaled:
+        h = img.size[1]
+        if current and current_h + h > max_strip_height:
+            strip_groups.append(current)
+            current = [img]
+            current_h = h
+        else:
+            current.append(img)
+            current_h += h
+    if current:
+        strip_groups.append(current)
+
+    # Stitch each group into one canvas, then pack into ZIP
+    zip_buf = io.BytesIO()
+    strip_count = len(strip_groups)
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for i, group in enumerate(strip_groups, start=1):
+            total_h = sum(img.size[1] for img in group)
+            canvas = PILImage.new("RGB", (target_w, total_h), (255, 255, 255))
+            y_off = 0
+            for img in group:
+                canvas.paste(img, (0, y_off))
+                y_off += img.size[1]
+
+            img_buf = io.BytesIO()
+            canvas.save(img_buf, format="JPEG", quality=95, optimize=True)
+            img_buf.seek(0)
+
+            name = f"strip_{i:03d}_of_{strip_count:03d}.jpg"
+            zf.writestr(name, img_buf.read())
+            log.info(f"Stitch: strip {i}/{strip_count} — {target_w}×{total_h} px, {len(group)} panels")
+
+    zip_buf.seek(0)
+    return zip_buf, strip_count
+
+
 # ─── Slash Commands ───────────────────────────────────────────────────────────
 
 @client.tree.command(
@@ -374,15 +461,16 @@ def _split_zip_if_needed(results, limit=DISCORD_SIZE_LIMIT):
 )
 @app_commands.describe(
     url="The full URL of the webpage to scrape",
-    delivery="How to receive the images: ZIP attached here, or a Google Drive link",
+    delivery="How to receive the images: ZIP, Smart Stitch (stitched strips), or Google Drive",
     min_size="Ignore images smaller than this many KB (default: 5)",
     image_type="Only download this type (leave blank for all)",
-    max_count="Maximum number of images to include (default: 100, max: 300)",
+    max_count="Maximum number of images to include (default: 300, max: 300)",
 )
 @app_commands.choices(
     delivery=[
-        app_commands.Choice(name="📦 ZIP file (attach here)",    value="zip"),
-        app_commands.Choice(name="☁️ Google Drive (shared link)", value="gdrive"),
+        app_commands.Choice(name="📦 ZIP file (attach here)",         value="zip"),
+        app_commands.Choice(name="🧵 Smart Stitch (stitched strips)",  value="stitch"),
+        app_commands.Choice(name="☁️ Google Drive (shared link)",      value="gdrive"),
     ],
     image_type=[
         app_commands.Choice(name="All types",  value="all"),
@@ -400,7 +488,7 @@ async def download_images(
     delivery: str = "zip",
     min_size: int = 5,
     image_type: str = "all",
-    max_count: int = 100,
+    max_count: int = 300,
 ):
     await interaction.response.defer(thinking=True)
 
@@ -460,7 +548,12 @@ async def download_images(
 
     urls_to_dl = image_urls[:max_count]
 
-    delivery_label = "☁️ Google Drive" if delivery == "gdrive" else "📦 ZIP"
+    if delivery == "gdrive":
+        delivery_label = "☁️ Google Drive"
+    elif delivery == "stitch":
+        delivery_label = "🧵 Smart Stitch"
+    else:
+        delivery_label = "📦 ZIP"
     progress_embed = discord.Embed(
         title="⏳ Downloading Images…",
         description=(
@@ -505,9 +598,65 @@ async def download_images(
         await progress_msg.edit(embed=embed)
         return
 
-    # ══════════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════════════
+    # DELIVERY: Smart Stitch
+    # ════════════════════════════════════════════════════════════════════════════
+    if delivery == "stitch":
+        stitching_embed = discord.Embed(
+            title="🧵 Stitching Images…",
+            description=(
+                f"Downloaded **{successful}** panels.\n"
+                "Stitching into strips of ≤ 15 000 px height… this may take a moment."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await progress_msg.edit(embed=stitching_embed)
+
+        try:
+            zip_buf, strip_count = await asyncio.to_thread(_smart_stitch, results)
+            zip_size = len(zip_buf.getvalue())
+        except Exception as exc:
+            log.error(f"Smart Stitch failed: {exc}")
+            err_embed = discord.Embed(
+                title="❌ Smart Stitch Failed",
+                description=f"**Error:** {exc}",
+                color=discord.Color.red(),
+            )
+            await progress_msg.edit(embed=err_embed)
+            return
+
+        result_embed = discord.Embed(
+            title="✅ Smart Stitch Ready!",
+            color=discord.Color.green(),
+        )
+        result_embed.add_field(name="🌐 Source",          value=url,                              inline=False)
+        result_embed.add_field(name="🖼️ Panels Downloaded", value=str(successful),                 inline=True)
+        result_embed.add_field(name="🧵 Strips",          value=str(strip_count),                 inline=True)
+        result_embed.add_field(name="📊 Strip Height",    value="≤ 15 000 px each",                 inline=True)
+        result_embed.add_field(name="📦 ZIP Size",         value=f"{zip_size/1024/1024:.2f} MB",   inline=True)
+        if type_filter:
+            result_embed.add_field(name="🔍 Filter", value=type_filter, inline=True)
+        result_embed.set_footer(text="Panels stitched at JPEG quality 95 · 15 000 px max strip height")
+
+        await progress_msg.edit(embed=result_embed)
+
+        # Split ZIP across messages if needed (rare for stitched output)
+        zip_parts = [(zip_buf, strip_count)]
+        if zip_size > DISCORD_SIZE_LIMIT:
+            # Re-split using the standard splitter (strips are already JPEG, not re-zipped)
+            zip_parts = await asyncio.to_thread(_split_zip_if_needed, results)
+
+        files = [
+            discord.File(buf, filename=f"stitched_part{i+1}.zip" if len(zip_parts) > 1 else "stitched.zip")
+            for i, (buf, _) in enumerate(zip_parts)
+        ]
+        for i in range(0, len(files), 10):
+            await interaction.followup.send(files=files[i:i+10])
+        return
+
+    # ════════════════════════════════════════════════════════════════════════════
     # DELIVERY: Google Drive
-    # ══════════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════════════
     if delivery == "gdrive":
         # Build a single ZIP (no 25 MB split needed — Drive has no limit)
         uploading_embed = discord.Embed(
