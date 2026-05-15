@@ -9,6 +9,7 @@ import zipfile
 import re
 import os
 import threading
+import concurrent.futures
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
@@ -107,22 +108,35 @@ async def download_images(interaction: discord.Interaction, url: str):
         await interaction.followup.send(f"No images found on {url} or the page is protected/requires JavaScript rendering.")
         return
         
-    await interaction.followup.send(f"Found {len(image_urls)} images. Downloading and packing them into a zip file...")
+    await interaction.followup.send(f"Found {len(image_urls)} images. Downloading concurrently and packing into a zip...")
     
     zip_buffer = io.BytesIO()
     scraper = cloudscraper.create_scraper()
     
+    # We will limit to 200 images max
+    urls_to_download = list(image_urls)[:200]
+    
+    def fetch_image(data):
+        index, img_url = data
+        try:
+            # We use a slight longer timeout in case of concurrency bottlenecks
+            img_response = scraper.get(img_url, timeout=10)
+            if img_response.status_code == 200:
+                content_type = img_response.headers.get('content-type', '')
+                return index, img_url, img_response.content, content_type
+        except Exception as e:
+            print(f"Failed to download {img_url}: {e}")
+        return index, img_url, None, None
+
     with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
         count = 0
-        for img_url in image_urls:
-            if count >= 200:  # Hard limit to avoid giant files and memory issues
-                break
-                
-            try:
-                img_response = scraper.get(img_url, timeout=5)
-                if img_response.status_code == 200:
-                    content_type = img_response.headers.get('content-type', '')
-                    
+        # Use ThreadPoolExecutor to download 15 images at the same time
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            # executor.map maintains the original order of URLs
+            results = executor.map(fetch_image, enumerate(urls_to_download))
+            
+            for index, img_url, content, content_type in results:
+                if content:
                     # Guess extension from content type
                     ext = '.jpg'
                     if 'png' in content_type: ext = '.png'
@@ -134,18 +148,15 @@ async def download_images(interaction: discord.Interaction, url: str):
                     parsed = urllib.parse.urlparse(img_url)
                     path_name = os.path.basename(parsed.path)
                     if path_name and '.' in path_name:
-                        # Clean up query params from filename if any
                         filename = path_name
                     else:
-                        filename = f"image_{count}{ext}"
+                        filename = f"image_{index}{ext}"
                         
                     # Handle duplicate filenames in zip
-                    filename = f"{count}_{filename}"
+                    filename = f"{index:03d}_{filename}"
                         
-                    zip_file.writestr(filename, img_response.content)
+                    zip_file.writestr(filename, content)
                     count += 1
-            except Exception as e:
-                print(f"Failed to download {img_url}: {e}")
                 
     zip_buffer.seek(0)
     
