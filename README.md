@@ -1,2 +1,0 @@
-# Chap-Downloader
-chapters
