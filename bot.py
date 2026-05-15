@@ -7,6 +7,8 @@ import io
 import zipfile
 import re
 import os
+import sys
+import json
 import asyncio
 import aiohttp
 import threading
@@ -199,139 +201,49 @@ def _scrape_static(url: str) -> tuple[list[str], dict, str]:
 
 async def _scrape_playwright(url: str) -> tuple[list[str], dict, str]:
     """
-    JS-rendered fallback: launches headless Chromium via Playwright.
-    Strategy:
-      1. Intercept ALL image requests (catches lazy-loaded images).
-      2. Intercept XHR/fetch JSON responses — many manhwa sites serve
-         image lists via API calls (e.g. Shinigami.asia).
-      3. Use wait_until='load' + fixed sleep (NOT networkidle — many
-         sites poll forever and networkidle never fires).
-      4. Scroll the page to trigger lazy-loading.
-      5. Hard 60-second cap via asyncio.wait_for so Discord never times out.
+    Runs _playwright_worker.py in a subprocess with a hard 55-second OS-level
+    timeout. proc.kill() is the only reliable way to stop Playwright on Windows
+    when asyncio.wait_for cancellation doesn't propagate to the browser process.
     """
     if not PLAYWRIGHT_AVAILABLE:
-        log.warning("Playwright not installed — JS fallback unavailable. Run: pip install playwright && python -m playwright install chromium")
+        log.warning("Playwright not installed. Run: pip install playwright && python -m playwright install chromium")
         return [], {}, DEFAULT_UA
 
-    log.info(f"Static scrape found nothing — trying Playwright JS fallback for {url}")
+    log.info(f"Static scrape found nothing — trying Playwright subprocess for {url}")
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_playwright_worker.py")
 
-    async def _run() -> tuple[list[str], dict, str]:
-        intercepted: dict[str, None] = {}   # image URLs seen in network traffic
-        json_images: dict[str, None] = {}   # image URLs extracted from JSON API responses
-
-        # ── helpers ──────────────────────────────────────────────────────────
-        _IMG_URL_RE = re.compile(
-            r'https?://[^\s\'"<>]+\.(?:jpg|jpeg|png|webp|gif|avif|bmp)(?:\?[^\s\'"<>]*)?',
-            re.IGNORECASE,
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, worker, url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-
-        def _register_img_url(img_url: str, store: dict):
-            if img_url.startswith("data:") or _is_ui_url(img_url):
-                return
-            parsed_path = urllib.parse.urlparse(img_url).path.lower()
-            ext = os.path.splitext(parsed_path)[1]
-            if ext == "" or ext in SUPPORTED_EXTS:
-                store[img_url] = None
-
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                      "--disable-blink-features=AutomationControlled"],
-            )
-            context = await browser.new_context(
-                user_agent=DEFAULT_UA,
-                viewport={"width": 1280, "height": 900},
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-            )
-            page = await context.new_page()
-
-            # 1. Intercept image requests
-            def _on_request(request):
-                if request.resource_type == "image":
-                    _register_img_url(request.url, intercepted)
-
-            page.on("request", _on_request)
-
-            # 2. Intercept XHR/fetch JSON responses for API-served image lists
-            async def _on_response(response):
-                try:
-                    ct = response.headers.get("content-type", "")
-                    if "json" in ct or "javascript" in ct:
-                        text = await response.text()
-                        for match in _IMG_URL_RE.finditer(text):
-                            _register_img_url(match.group(0), json_images)
-                except Exception:
-                    pass
-
-            page.on("response", _on_response)
-
-            # 3. Navigate — use 'load' not 'networkidle' (polling sites never reach idle)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=55)
+        except asyncio.TimeoutError:
+            log.warning(f"Playwright subprocess timed out for {url} — killing")
             try:
-                await page.goto(url, wait_until="load", timeout=30_000)
-            except Exception as exc:
-                log.warning(f"Playwright goto error (continuing): {exc}")
-
-            # 4. Wait for JS to render images (fixed sleep — reliable unlike networkidle)
-            await asyncio.sleep(5)
-
-            # 5. Scroll to trigger lazy-loading, then wait for those requests
-            try:
-                await page.evaluate("""
-                    async () => {
-                        await new Promise(resolve => {
-                            const total = document.body.scrollHeight;
-                            let scrolled = 0;
-                            const step = Math.max(400, Math.floor(total / 15));
-                            const timer = setInterval(() => {
-                                window.scrollBy(0, step);
-                                scrolled += step;
-                                if (scrolled >= total) { clearInterval(timer); resolve(); }
-                            }, 150);
-                        });
-                    }
-                """)
-                await asyncio.sleep(3)   # let lazy image requests fire
+                proc.kill()
             except Exception:
                 pass
+            await proc.wait()
+            return [], {}, DEFAULT_UA
 
-            # 6. Parse final live DOM
-            html = await page.content()
-            soup = BeautifulSoup(html, "html.parser")
-            dom_urls = _parse_soup_for_images(soup, url)
+        if stderr:
+            log.debug(f"Playwright worker: {stderr.decode(errors='replace')[:300]}")
 
-            # 7. Also scan all inline <script> tags for image URL patterns
-            for script in soup.find_all("script"):
-                text = script.string or ""
-                for match in _IMG_URL_RE.finditer(text):
-                    _register_img_url(match.group(0), json_images)
+        if not stdout or proc.returncode != 0:
+            log.warning(f"Playwright worker exit code {proc.returncode}")
+            return [], {}, DEFAULT_UA
 
-            # 8. Collect cookies
-            raw_cookies = await context.cookies()
-            cookies = {c["name"]: c["value"] for c in raw_cookies}
+        data    = json.loads(stdout.decode())
+        urls    = data.get("urls", [])
+        cookies = data.get("cookies", {})
+        log.info(f"Playwright subprocess found {len(urls)} image URL(s)")
+        return urls, cookies, DEFAULT_UA
 
-            await browser.close()
-
-        # Merge: JSON/API urls first (ordered), then network-intercepted, then DOM
-        all_urls: dict[str, None] = {}
-        for u in json_images:
-            all_urls[u] = None
-        for u in intercepted:
-            all_urls[u] = None
-        for u in dom_urls:
-            all_urls[u] = None
-
-        log.info(
-            f"Playwright found {len(all_urls)} URL(s) "
-            f"[json_api={len(json_images)}, intercepted={len(intercepted)}, dom={len(dom_urls)}]"
-        )
-        return list(all_urls.keys()), cookies, DEFAULT_UA
-
-    # Hard 60-second cap so Discord interaction never times out
-    try:
-        return await asyncio.wait_for(_run(), timeout=60)
-    except asyncio.TimeoutError:
-        log.warning(f"Playwright hard-timeout (60 s) reached for {url}")
+    except Exception as exc:
+        log.error(f"Playwright subprocess error: {exc}")
         return [], {}, DEFAULT_UA
 
 
