@@ -281,6 +281,9 @@ async def _scrape_shinigami_api(url: str) -> tuple[list[str], dict, str]:
         "Referer":         "https://g.shinigami.asia/",
         "DNT":             "1",
         "Sec-GPC":         "1",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     try:
         def _fetch_api():
             scraper = cloudscraper.create_scraper(
