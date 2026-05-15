@@ -262,7 +262,7 @@ async def _scrape_shinigami_api(url: str) -> tuple[list[str], dict, str]:
     """
     Uses the real Shinigami API discovered from the Tachiyomi extension source:
       GET https://api.shngm.io/v1/chapter/detail/{chapter-id}
-      Images: https://storage.shngm.id{pageList.chapterPage.path}{imageName}
+      Images: {base_url}{chapter.path}{page_filename}
 
     Required headers: Origin, DNT, Sec-GPC, Accept: application/json
     """
@@ -297,16 +297,31 @@ async def _scrape_shinigami_api(url: str) -> tuple[list[str], dict, str]:
         return [], {}, DEFAULT_UA
 
     try:
-        page_list    = data["pageList"]
-        chapter_page = page_list["chapterPage"]
-        path         = chapter_page["path"]       # e.g. "/manga/xxx/chapter-1/"
-        pages        = chapter_page["pages"]      # e.g. ["001.jpg", "002.jpg", ...]
+        # Expected structure:
+        # data: { base_url: "...", chapter: { path: "...", data: ["01.jpg", ...] } }
+        api_data = data.get("data", {})
+        base_url = api_data.get("base_url", "https://assets.shngm.id")
+        chapter_info = api_data.get("chapter", {})
+        path = chapter_info.get("path", "")
+        pages = chapter_info.get("data", [])
+        
+        if not pages:
+            # Fallback to the old Tachiyomi extension structure just in case
+            page_list = data.get("pageList", {})
+            chapter_page = page_list.get("chapterPage", {})
+            path = chapter_page.get("path", path)
+            pages = chapter_page.get("pages", [])
+            base_url = "https://storage.shngm.id"
+            
     except (KeyError, TypeError) as exc:
         log.warning(f"shngm.io unexpected response shape: {exc} — raw: {str(data)[:300]}")
         return [], {}, DEFAULT_UA
 
-    cdn = "https://storage.shngm.id"
-    image_urls = [f"{cdn}{path}{p}" for p in pages]
+    if not pages:
+        log.warning("shngm.io API returned empty page list")
+        return [], {}, DEFAULT_UA
+
+    image_urls = [f"{base_url}{path}{p}" for p in pages]
     log.info(f"shngm.io API: {len(image_urls)} pages for chapter {chapter_id}")
     return image_urls, {}, DEFAULT_UA
 
