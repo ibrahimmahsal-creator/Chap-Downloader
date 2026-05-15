@@ -285,13 +285,21 @@ async def _scrape_shinigami_api(url: str) -> tuple[list[str], dict, str]:
     }
 
     try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(api_endpoint, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                log.info(f"shngm.io API status: {resp.status}")
-                if resp.status != 200:
-                    log.warning(f"shngm.io API returned {resp.status}")
-                    return [], {}, DEFAULT_UA
-                data = await resp.json(content_type=None)
+        def _fetch_api():
+            scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            )
+            resp = scraper.get(api_endpoint, headers=headers, timeout=15)
+            return resp
+
+        resp = await asyncio.to_thread(_fetch_api)
+        log.info(f"shngm.io API status: {resp.status_code}")
+        
+        if resp.status_code != 200:
+            log.warning(f"shngm.io API returned {resp.status_code}")
+            return [], {}, DEFAULT_UA
+            
+        data = resp.json()
     except Exception as exc:
         log.warning(f"shngm.io API error: {exc}")
         return [], {}, DEFAULT_UA
