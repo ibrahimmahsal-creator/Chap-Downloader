@@ -1,0 +1,5 @@
+discord.py
+beautifulsoup4
+requests
+cloudscraper
+python-dotenv
