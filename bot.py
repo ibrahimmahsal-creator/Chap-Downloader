@@ -711,38 +711,25 @@ async def download_images(
         return
 
     # ══════════════════════════════════════════════════════════════════════════
-    # DELIVERY: ZIP (attach to Discord)
+    # DELIVERY: ZIP (attach to Discord) — always one single ZIP, never split
     # ══════════════════════════════════════════════════════════════════════════
-    zip_parts = await asyncio.to_thread(_split_zip_if_needed, results)
-    successful = sum(c for _, c in zip_parts)
+    zip_buf, successful = await asyncio.to_thread(_build_zip, results)
+    zip_size = len(zip_buf.getvalue())
 
-    size_total = sum(len(b.getvalue()) for b, _ in zip_parts)
     result_embed = discord.Embed(
         title="✅ Images Ready!",
         color=discord.Color.green(),
     )
-    result_embed.add_field(name="🌐 Source",         value=url,                                  inline=False)
-    result_embed.add_field(name="🖼️ Images Found",   value=str(len(image_urls)),                 inline=True)
-    result_embed.add_field(name="⬇️ Downloaded",     value=str(successful),                      inline=True)
-    result_embed.add_field(name="📦 ZIP Size",        value=f"{size_total/1024/1024:.2f} MB",     inline=True)
+    result_embed.add_field(name="🌐 Source",       value=url,                              inline=False)
+    result_embed.add_field(name="🖼️ Images Found", value=str(len(image_urls)),             inline=True)
+    result_embed.add_field(name="⬇️ Downloaded",   value=str(successful),                  inline=True)
+    result_embed.add_field(name="📦 ZIP Size",      value=f"{zip_size/1024/1024:.2f} MB",  inline=True)
     if type_filter:
         result_embed.add_field(name="🔍 Filter", value=type_filter, inline=True)
-    if len(zip_parts) > 1:
-        result_embed.add_field(
-            name="⚡ Split ZIPs",
-            value=f"File was too large — split into **{len(zip_parts)}** ZIPs",
-            inline=False,
-        )
     result_embed.set_footer(text="Images packed with ZIP_DEFLATE compression")
 
-    files = [
-        discord.File(buf, filename=f"images_part{i+1}.zip" if len(zip_parts) > 1 else "images.zip")
-        for i, (buf, _) in enumerate(zip_parts)
-    ]
-
     await progress_msg.edit(embed=result_embed)
-    for i in range(0, len(files), 10):
-        await interaction.followup.send(files=files[i:i+10])
+    await interaction.followup.send(file=discord.File(zip_buf, filename="images.zip"))
 
 
 @client.tree.command(
