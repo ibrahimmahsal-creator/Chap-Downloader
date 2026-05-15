@@ -1,5 +1,6 @@
-discord.py
-beautifulsoup4
-requests
-cloudscraper
-python-dotenv
+discord.py>=2.3.0
+beautifulsoup4>=4.12.0
+aiohttp>=3.9.0
+cloudscraper>=1.2.71
+python-dotenv>=1.0.0
+lxml>=5.0.0
