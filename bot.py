@@ -162,11 +162,14 @@ async def download_images(interaction: discord.Interaction, url: str):
     
     # Check size limit (Discord allows 25MB for regular users)
     size_mb = len(zip_buffer.getvalue()) / (1024 * 1024)
-    if size_mb > 25:
-        await interaction.channel.send(f"⚠️ The zip file is too large ({size_mb:.2f} MB) to send directly. Discord's limit is 25MB. \n\nHowever, {count} images were found. (We can implement Google Drive upload here later!)")
+    
+    if count == 0:
+        await interaction.followup.send(f"⚠️ Failed to download any images from {url}. They might be protected or broken links.")
+    elif size_mb > 25:
+        await interaction.followup.send(f"⚠️ The zip file is too large ({size_mb:.2f} MB) to send directly. Discord's limit is 25MB. \n\nHowever, {count} images were successfully found.")
     else:
         file = discord.File(fp=zip_buffer, filename="extracted_images.zip")
-        await interaction.channel.send(f"✅ Successfully downloaded {count} images from {url}:", file=file)
+        await interaction.followup.send(f"✅ Successfully downloaded {count} images from {url}:", file=file)
 
 if __name__ == "__main__":
     if not TOKEN or TOKEN == "your_discord_bot_token_here":
