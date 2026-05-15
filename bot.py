@@ -8,9 +8,8 @@ import io
 import zipfile
 import re
 import os
-import threading
-import concurrent.futures
 import asyncio
+import aiohttp
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
@@ -55,7 +54,7 @@ async def on_ready():
 
 def get_images_from_url(url):
     try:
-        # Using cloudscraper to bypass simple anti-bot protections (like Cloudflare)
+        # Using cloudscraper to bypass simple anti-bot protections
         scraper = cloudscraper.create_scraper()
         response = scraper.get(url, timeout=15)
         response.raise_for_status()
@@ -69,7 +68,7 @@ def get_images_from_url(url):
             if src:
                 image_urls.add(urllib.parse.urljoin(url, src))
                 
-        # 2. Find <source> inside <picture> tags (for responsive images)
+        # 2. Find <source> inside <picture> tags
         for source in soup.find_all('source'):
             srcset = source.get('srcset')
             if srcset:
@@ -86,10 +85,10 @@ def get_images_from_url(url):
                 if u and not u.startswith('data:'):
                     image_urls.add(urllib.parse.urljoin(url, u))
                     
-        return list(image_urls)
+        return list(image_urls), scraper.cookies.get_dict(), scraper.headers.get('User-Agent', '')
     except Exception as e:
         print(f"Error scraping {url}: {e}")
-        return []
+        return [], {}, ""
 
 @client.tree.command(name="download_images", description="Extract and download all images from a webpage (like Imageye).")
 @app_commands.describe(url="The URL of the webpage to scrape")
@@ -100,10 +99,7 @@ async def download_images(interaction: discord.Interaction, url: str):
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
         
-    image_urls = get_images_from_url(url)
-    
-    # Filter out common non-image paths or very small tracking pixels if desired
-    # For now, we try to download them all
+    image_urls, cookies, user_agent = await asyncio.to_thread(get_images_from_url, url)
     
     if not image_urls:
         await interaction.followup.send(f"No images found on {url} or the page is protected/requires JavaScript rendering.")
@@ -111,49 +107,47 @@ async def download_images(interaction: discord.Interaction, url: str):
         
     await interaction.followup.send(f"Found {len(image_urls)} images. Downloading concurrently and packing into a zip...")
     
-    zip_buffer = io.BytesIO()
+    # We will limit to 200 images max
+    urls_to_download = list(image_urls)[:200]
     
-    def download_all_images():
-        scraper = cloudscraper.create_scraper()
-        urls_to_download = list(image_urls)[:200]
-        
-        def fetch_image(data):
-            index, img_url = data
-            try:
-                img_response = scraper.get(img_url, timeout=10)
-                if img_response.status_code == 200:
-                    content_type = img_response.headers.get('content-type', '')
-                    return index, img_url, img_response.content, content_type
-            except Exception as e:
-                print(f"Failed to download {img_url}: {e}")
-            return index, img_url, None, None
+    async def fetch_image(session, index, img_url):
+        try:
+            async with session.get(img_url, timeout=15) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    content_type = response.headers.get('Content-Type', '')
+                    return index, img_url, content, content_type
+        except Exception as e:
+            print(f"Failed to download {img_url}: {e}")
+        return index, img_url, None, None
 
-        downloaded_count = 0
-        with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                results = executor.map(fetch_image, enumerate(urls_to_download))
-                for index, img_url, content, content_type in results:
-                    if content:
-                        ext = '.jpg'
-                        if 'png' in content_type: ext = '.png'
-                        elif 'gif' in content_type: ext = '.gif'
-                        elif 'webp' in content_type: ext = '.webp'
-                        elif 'svg' in content_type: ext = '.svg'
-                        
-                        parsed = urllib.parse.urlparse(img_url)
-                        path_name = os.path.basename(parsed.path)
-                        if path_name and '.' in path_name:
-                            filename = path_name
-                        else:
-                            filename = f"image_{index}{ext}"
-                            
-                        filename = f"{index:03d}_{filename}"
-                        zip_file.writestr(filename, content)
-                        downloaded_count += 1
-        return downloaded_count
+    # Download everything purely async using aiohttp and the Cloudflare cookies!
+    async with aiohttp.ClientSession(cookies=cookies, headers={'User-Agent': user_agent}) as session:
+        tasks = [fetch_image(session, i, u) for i, u in enumerate(urls_to_download)]
+        results = await asyncio.gather(*tasks)
 
-    # Run the blocking downloads in a background thread so we don't disconnect from Discord!
-    count = await asyncio.to_thread(download_all_images)
+    # Now we write to zip synchronously
+    zip_buffer = io.BytesIO()
+    count = 0
+    with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
+        for index, img_url, content, content_type in results:
+            if content:
+                ext = '.jpg'
+                if 'png' in content_type: ext = '.png'
+                elif 'gif' in content_type: ext = '.gif'
+                elif 'webp' in content_type: ext = '.webp'
+                elif 'svg' in content_type: ext = '.svg'
+                
+                parsed = urllib.parse.urlparse(img_url)
+                path_name = os.path.basename(parsed.path)
+                if path_name and '.' in path_name:
+                    filename = path_name
+                else:
+                    filename = f"image_{index}{ext}"
+                    
+                filename = f"{index:03d}_{filename}"
+                zip_file.writestr(filename, content)
+                count += 1
                 
     zip_buffer.seek(0)
     
