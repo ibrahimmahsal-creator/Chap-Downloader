@@ -69,8 +69,9 @@ _UI_SKIP_WORDS = {
 # HTML block-level tags whose contents are never manhwa chapter panels
 _UI_ANCESTORS = {"nav", "header", "footer", "aside", "button"}
 
-# Minimum width (px) a manhwa panel must have — filters icons / thumbnails
-MINIMUM_PANEL_WIDTH = 300
+# Minimum dimensions (px) a manhwa panel must meet — filters icons / thumbnails
+MINIMUM_PANEL_WIDTH  = 450
+MINIMUM_PANEL_HEIGHT = 450
 
 
 def _is_ui_url(img_url: str) -> bool:
@@ -82,8 +83,8 @@ def _is_ui_url(img_url: str) -> bool:
 
 def _is_manhwa_panel(data: bytes, content_type: str) -> bool:
     """
-    Return True only if the image is wide enough to be a manhwa chapter panel.
-    Requires Pillow; falls back to True (keep) if unavailable or unreadable.
+    Return True only if the image meets the minimum width AND height to be a
+    manhwa chapter panel. Requires Pillow; falls back to True if unavailable.
     SVGs are always kept — they have no raster dimensions.
     """
     if not PIL_AVAILABLE:
@@ -93,7 +94,7 @@ def _is_manhwa_panel(data: bytes, content_type: str) -> bool:
     try:
         img = PILImage.open(io.BytesIO(data))
         w, h = img.size
-        return w >= MINIMUM_PANEL_WIDTH
+        return w >= MINIMUM_PANEL_WIDTH and h >= MINIMUM_PANEL_HEIGHT
     except Exception:
         return True   # can't read — keep it rather than silently drop
 
