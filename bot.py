@@ -295,13 +295,13 @@ async def _scrape_shinigami_api(url: str) -> tuple[list[str], dict, str]:
         resp = await asyncio.to_thread(_fetch_api)
         
         if resp.status_code != 200:
-            raise RuntimeError(f"shngm.io API returned {resp.status_code}\nBody: {resp.text[:500]}")
+            log.warning(f"shngm.io API returned {resp.status_code} (Cloudflare block)")
+            return [], {}, DEFAULT_UA
             
         data = resp.json()
     except Exception as exc:
-        if isinstance(exc, RuntimeError):
-            raise
-        raise RuntimeError(f"Network error calling shngm.io: {exc}")
+        log.warning(f"Network error calling shngm.io: {exc}")
+        return [], {}, DEFAULT_UA
 
     try:
         # Expected structure:
@@ -321,10 +321,12 @@ async def _scrape_shinigami_api(url: str) -> tuple[list[str], dict, str]:
             base_url = "https://storage.shngm.id"
             
     except (KeyError, TypeError) as exc:
-        raise RuntimeError(f"shngm.io parsing error: {exc}\nRaw: {str(data)[:500]}")
+        log.warning(f"shngm.io parsing error: {exc}\nRaw: {str(data)[:500]}")
+        return [], {}, DEFAULT_UA
 
     if not pages:
-        raise RuntimeError(f"shngm.io API returned empty pages list!\nRaw data keys: {list(data.keys())}")
+        log.warning(f"shngm.io API returned empty pages list!\nRaw data keys: {list(data.keys())}")
+        return [], {}, DEFAULT_UA
 
     image_urls = [f"{base_url}{path}{p}" for p in pages]
     log.info(f"shngm.io API: {len(image_urls)} pages for chapter {chapter_id}")
@@ -670,17 +672,7 @@ async def download_images(
     type_filter = None if image_type == "all" else image_type
 
     log.info(f"Scraping: {url}")
-    
-    try:
-        image_urls, cookies, user_agent = await _scrape_image_urls(url)
-    except RuntimeError as exc:
-        embed = discord.Embed(
-            title="🔍 Scraper Debug Data",
-            description=f"```\n{str(exc)}\n```",
-            color=discord.Color.gold(),
-        )
-        await interaction.followup.send(embed=embed)
-        return
+    image_urls, cookies, user_agent = await _scrape_image_urls(url)
 
     if not image_urls:
         embed = discord.Embed(

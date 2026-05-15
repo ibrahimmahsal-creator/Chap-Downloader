@@ -62,6 +62,17 @@ async def scrape(url):
                 ct = resp.headers.get("content-type", "")
                 if "json" in ct or "javascript" in ct:
                     text = await resp.text()
+                    
+                    # Specialized Shinigami API parsing
+                    if "shngm.io/v1/chapter/detail" in resp.url:
+                        data = json.loads(text)
+                        api_data = data.get("data", {})
+                        base = api_data.get("base_url", "https://assets.shngm.id")
+                        chap = api_data.get("chapter", {})
+                        path = chap.get("path", "")
+                        for p in chap.get("data", []):
+                            _add(f"{base}{path}{p}", json_imgs)
+
                     for m in IMG_RE.finditer(text):
                         _add(m.group(0), json_imgs)
             except Exception:
