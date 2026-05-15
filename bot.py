@@ -8,12 +8,31 @@ import io
 import zipfile
 import re
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+# Dummy web server for Render health checks running in a separate thread
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is awake and running!")
+
+def start_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    print(f"Dummy web server listening on port {port} for Render")
+    server.serve_forever()
+
+# Start the web server immediately in the background
+threading.Thread(target=start_web_server, daemon=True).start()
 
 class ImageScraperBot(discord.Client):
     def __init__(self):
