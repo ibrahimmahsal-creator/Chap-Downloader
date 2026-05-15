@@ -493,21 +493,22 @@ async def download_images(
 ):
     await interaction.response.defer(thinking=True)
 
-    # ── Validate Google Drive availability early ──
+    # ── Validate Google Drive availability — fall back to ZIP if not ready ──
     if delivery == "gdrive":
         if not GDRIVE_AVAILABLE:
+            delivery = "zip"
             await interaction.followup.send(
-                "❌ **Google Drive not available.** The required libraries aren't installed.\n"
-                "Run: `pip install google-auth google-auth-oauthlib google-api-python-client`"
+                "⚠️ **Google Drive libraries not installed** — falling back to ZIP.\n"
+                "Run: `pip install google-auth google-auth-oauthlib google-api-python-client`",
+                ephemeral=True,
             )
-            return
-        if not GDRIVE_SERVICE_ACCOUNT:
+        elif not GDRIVE_SERVICE_ACCOUNT:
+            delivery = "zip"
             await interaction.followup.send(
-                "❌ **Google Drive not configured.**\n"
-                "Set `GDRIVE_SERVICE_ACCOUNT_JSON` in your `.env` file with the path to "
-                "(or contents of) your Google Service Account JSON key."
+                "⚠️ **Google Drive not configured** — falling back to ZIP.\n"
+                "Set `GDRIVE_SERVICE_ACCOUNT_JSON` in your `.env` file to enable Drive uploads.",
+                ephemeral=True,
             )
-            return
 
     # ── Normalise URL ──
     url = url.strip()
@@ -711,11 +712,72 @@ async def download_images(
         return
 
     # ══════════════════════════════════════════════════════════════════════════
-    # DELIVERY: ZIP (attach to Discord) — always one single ZIP, never split
+    # DELIVERY: ZIP — auto-escalates to Google Drive if ZIP exceeds 10 MB
     # ══════════════════════════════════════════════════════════════════════════
     zip_buf, successful = await asyncio.to_thread(_build_zip, results)
     zip_size = len(zip_buf.getvalue())
 
+    if zip_size > DISCORD_SIZE_LIMIT:
+        log.info(f"ZIP is {zip_size/1024/1024:.1f} MB > 10 MB — escalating to Google Drive")
+
+        if not GDRIVE_AVAILABLE or not GDRIVE_SERVICE_ACCOUNT:
+            err_embed = discord.Embed(
+                title="❌ ZIP Too Large for Discord",
+                description=(
+                    f"The ZIP is **{zip_size/1024/1024:.1f} MB** — over Discord's 10 MB limit.\n\n"
+                    "**Option 1:** Use **☁️ Google Drive** delivery next time.\n"
+                    "**Option 2:** Set `GDRIVE_SERVICE_ACCOUNT_JSON` in `.env` for auto-upload.\n"
+                    "**Option 3:** Use **🧵 Smart Stitch** to compress panels into fewer files."
+                ),
+                color=discord.Color.red(),
+            )
+            await progress_msg.edit(embed=err_embed)
+            return
+
+        uploading_embed = discord.Embed(
+            title="☁️ ZIP Too Large — Uploading to Google Drive…",
+            description=(
+                f"ZIP is **{zip_size/1024/1024:.1f} MB** (over 10 MB Discord limit).\n"
+                "Auto-uploading to Google Drive instead…"
+            ),
+            color=discord.Color.blurple(),
+        )
+        await progress_msg.edit(embed=uploading_embed)
+
+        try:
+            hostname  = urllib.parse.urlparse(url).netloc.replace("www.", "")
+            safe_name = re.sub(r"[^\w\-.]", "_", hostname)
+            filename  = f"{safe_name}_images.zip"
+            drive_link = await asyncio.to_thread(_upload_to_drive, zip_buf, filename)
+        except Exception as exc:
+            log.error(f"Auto Google Drive upload failed: {exc}")
+            err_embed = discord.Embed(
+                title="❌ ZIP Too Large & Drive Upload Failed",
+                description=(
+                    f"ZIP is **{zip_size/1024/1024:.1f} MB** and Drive upload also failed.\n"
+                    f"**Error:** {exc}"
+                ),
+                color=discord.Color.red(),
+            )
+            await progress_msg.edit(embed=err_embed)
+            return
+
+        result_embed = discord.Embed(
+            title="✅ Auto-Uploaded to Google Drive!",
+            description=f"ZIP was {zip_size/1024/1024:.1f} MB — too large for Discord, uploaded to Drive automatically.",
+            color=discord.Color.green(),
+        )
+        result_embed.add_field(name="🌐 Source",       value=url,                               inline=False)
+        result_embed.add_field(name="🖼️ Images Found", value=str(len(image_urls)),              inline=True)
+        result_embed.add_field(name="⬇️ Downloaded",   value=str(successful),                   inline=True)
+        result_embed.add_field(name="📦 ZIP Size",      value=f"{zip_size/1024/1024:.2f} MB",   inline=True)
+        result_embed.add_field(name="☁️ Drive Link",   value=f"[Click to open]({drive_link})",  inline=False)
+        result_embed.set_footer(text="Auto-escalated to Google Drive · ZIP_DEFLATE compression")
+        await progress_msg.edit(embed=result_embed)
+        await interaction.followup.send(f"☁️ **Google Drive link:** {drive_link}")
+        return
+
+    # ── Small enough → attach directly to Discord ──
     result_embed = discord.Embed(
         title="✅ Images Ready!",
         color=discord.Color.green(),
