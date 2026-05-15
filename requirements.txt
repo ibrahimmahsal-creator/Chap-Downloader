@@ -5,3 +5,4 @@ cloudscraper>=1.2.71
 python-dotenv>=1.0.0
 lxml>=5.0.0
 Pillow>=10.0.0
+playwright>=1.44.0

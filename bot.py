@@ -15,6 +15,13 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
+# ─── Playwright (optional — JS-rendered page fallback) ───────────────────────
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 # ─── Pillow (optional — used for dimension filter & smart stitch) ─────────────
 try:
     from PIL import Image as PILImage
@@ -121,29 +128,18 @@ async def on_ready():
     )
 
 # ─── Scraping Logic ───────────────────────────────────────────────────────────
-def _scrape_image_urls(url: str) -> tuple[list[str], dict, str]:
-    scraper = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False}
-    )
-    headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "DNT": "1",
-    }
-    try:
-        resp = scraper.get(url, timeout=20, headers=headers)
-        resp.raise_for_status()
-    except Exception as exc:
-        log.warning(f"Scrape failed for {url}: {exc}")
-        return [], {}, ""
 
-    soup  = BeautifulSoup(resp.content, "html.parser")
-    found: dict[str, None] = {}   # ordered set — preserves DOM order
+DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+
+def _parse_soup_for_images(soup: BeautifulSoup, base_url: str) -> list[str]:
+    """Extract image URLs from a BeautifulSoup document."""
+    found: dict[str, None] = {}
 
     def add(src: str):
         if not src or src.startswith("data:"):
             return
-        full = urllib.parse.urljoin(url, src.strip())
+        full = urllib.parse.urljoin(base_url, src.strip())
         if _is_ui_url(full):
             return
         parsed_path = urllib.parse.urlparse(full).path.lower()
@@ -174,9 +170,127 @@ def _scrape_image_urls(url: str) -> tuple[list[str], dict, str]:
         for part in srcset.split(","):
             add(part.strip().split()[0])
 
-    ua      = scraper.headers.get("User-Agent") or "Mozilla/5.0"
+    return list(found.keys())
+
+
+def _scrape_static(url: str) -> tuple[list[str], dict, str]:
+    """Fast static HTML scrape via cloudscraper."""
+    scraper = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "DNT": "1",
+    }
+    try:
+        resp = scraper.get(url, timeout=20, headers=headers)
+        resp.raise_for_status()
+    except Exception as exc:
+        log.warning(f"Static scrape failed for {url}: {exc}")
+        return [], {}, DEFAULT_UA
+
+    soup    = BeautifulSoup(resp.content, "html.parser")
+    urls    = _parse_soup_for_images(soup, url)
+    ua      = scraper.headers.get("User-Agent") or DEFAULT_UA
     cookies = scraper.cookies.get_dict()
-    return list(found.keys()), cookies, ua
+    return urls, cookies, ua
+
+
+async def _scrape_playwright(url: str) -> tuple[list[str], dict, str]:
+    """
+    JS-rendered fallback: launches headless Chromium via Playwright,
+    waits for the network to settle, then extracts image URLs from the live DOM.
+    Also intercepts image network requests to catch lazily-loaded images.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        log.warning("Playwright not installed — JS fallback unavailable. Run: pip install playwright && playwright install chromium")
+        return [], {}, DEFAULT_UA
+
+    log.info(f"Static scrape found nothing — trying Playwright JS fallback for {url}")
+    intercepted: dict[str, None] = {}
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context = await browser.new_context(
+            user_agent=DEFAULT_UA,
+            viewport={"width": 1280, "height": 900},
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
+        page = await context.new_page()
+
+        # Intercept every image network request so we catch lazy-loaded ones
+        def _on_request(request):
+            if request.resource_type == "image":
+                img_url = request.url
+                if not _is_ui_url(img_url) and not img_url.startswith("data:"):
+                    parsed_path = urllib.parse.urlparse(img_url).path.lower()
+                    ext = os.path.splitext(parsed_path)[1]
+                    if ext == "" or ext in SUPPORTED_EXTS:
+                        intercepted[img_url] = None
+
+        page.on("request", _on_request)
+
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=45_000)
+        except Exception as exc:
+            log.warning(f"Playwright goto error (continuing anyway): {exc}")
+
+        # Scroll the page to trigger lazy-loading
+        try:
+            await page.evaluate("""
+                async () => {
+                    await new Promise(resolve => {
+                        let total = document.body.scrollHeight;
+                        let scrolled = 0;
+                        const step = Math.max(600, Math.floor(total / 20));
+                        const timer = setInterval(() => {
+                            window.scrollBy(0, step);
+                            scrolled += step;
+                            if (scrolled >= total) { clearInterval(timer); resolve(); }
+                        }, 120);
+                    });
+                }
+            """)
+            await asyncio.sleep(2)   # let lazy images fire
+        except Exception:
+            pass
+
+        # Parse the final live DOM
+        html  = await page.content()
+        soup  = BeautifulSoup(html, "html.parser")
+        dom_urls = _parse_soup_for_images(soup, url)
+
+        # Merge intercepted network image requests + DOM parse results
+        all_urls: dict[str, None] = {u: None for u in intercepted}
+        for u in dom_urls:
+            all_urls[u] = None
+
+        # Collect cookies for the download phase
+        raw_cookies = await context.cookies()
+        cookies = {c["name"]: c["value"] for c in raw_cookies}
+
+        await browser.close()
+
+    log.info(f"Playwright found {len(all_urls)} image URL(s) for {url}")
+    return list(all_urls.keys()), cookies, DEFAULT_UA
+
+
+async def _scrape_image_urls(url: str) -> tuple[list[str], dict, str]:
+    """
+    Primary entry point for scraping.
+    1. Try fast static HTML scrape.
+    2. If nothing found, fall back to Playwright headless browser.
+    """
+    urls, cookies, ua = await asyncio.to_thread(_scrape_static, url)
+    if urls:
+        log.info(f"Static scrape found {len(urls)} image URL(s).")
+        return urls, cookies, ua
+    # Static failed — JS-rendered page
+    return await _scrape_playwright(url)
 
 
 def _ext_from_content_type(ct: str, fallback_url: str) -> str:
@@ -446,7 +560,7 @@ async def download_images(
     type_filter = None if image_type == "all" else image_type
 
     log.info(f"Scraping: {url}")
-    image_urls, cookies, user_agent = await asyncio.to_thread(_scrape_image_urls, url)
+    image_urls, cookies, user_agent = await _scrape_image_urls(url)
 
     if not image_urls:
         embed = discord.Embed(
@@ -604,7 +718,7 @@ async def preview_images(interaction: discord.Interaction, url: str, count: int 
         url = "https://" + url
     count = max(1, min(count, 10))
 
-    image_urls, cookies, user_agent = await asyncio.to_thread(_scrape_image_urls, url)
+    image_urls, cookies, user_agent = await _scrape_image_urls(url)
     if not image_urls:
         await interaction.followup.send("❌ No images found on that page.")
         return
@@ -675,7 +789,7 @@ async def bot_info(interaction: discord.Interaction):
         ),
         inline=False,
     )
-    embed.set_footer(text="Built with discord.py · cloudscraper · aiohttp · BeautifulSoup4 · Pillow")
+    embed.set_footer(text="Built with discord.py · cloudscraper · aiohttp · BeautifulSoup4 · Pillow · Playwright")
     await interaction.response.send_message(embed=embed)
 
 
