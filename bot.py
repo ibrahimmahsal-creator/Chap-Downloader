@@ -266,71 +266,134 @@ def _split_zip(results, limit=DISCORD_SIZE_LIMIT) -> list[tuple[io.BytesIO, int]
     return [_build_zip(chunk) for chunk in chunks]
 
 
+def _split_stitch_zip(zip_buf: io.BytesIO, limit: int = DISCORD_SIZE_LIMIT) -> list[io.BytesIO]:
+    """
+    Split a stitch ZIP (containing JPEG strips) into multiple ZIPs each ≤ limit bytes.
+    Reads the already-created strips and repacks them — no re-stitching needed.
+    """
+    zip_buf.seek(0)
+    if len(zip_buf.getvalue()) <= limit:
+        zip_buf.seek(0)
+        return [zip_buf]
+
+    # Extract all strips in sorted order
+    strips: list[tuple[str, bytes]] = []
+    with zipfile.ZipFile(zip_buf, "r") as zf:
+        for name in sorted(zf.namelist()):
+            strips.append((name, zf.read(name)))
+
+    parts: list[io.BytesIO] = []
+    cur_buf  = io.BytesIO()
+    cur_zf   = zipfile.ZipFile(cur_buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1)
+    cur_size = 0
+    OVERHEAD = 512
+
+    for name, data in strips:
+        size = len(data) + OVERHEAD
+        if cur_size > 0 and cur_size + size > limit:
+            cur_zf.close()
+            cur_buf.seek(0)
+            parts.append(cur_buf)
+            cur_buf  = io.BytesIO()
+            cur_zf   = zipfile.ZipFile(cur_buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1)
+            cur_size = 0
+        cur_zf.writestr(name, data)
+        cur_size += size
+
+    cur_zf.close()
+    cur_buf.seek(0)
+    parts.append(cur_buf)
+    return parts
+
+
 def _smart_stitch(results, max_strip_height: int = 15000) -> tuple[io.BytesIO, int]:
+    """
+    Fast vertical stitch: decode each image only once, check dimensions inline,
+    process strip-by-strip to keep RAM low, save at JPEG quality 85.
+    Returns (zip_buffer, strip_count).
+    """
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow is required for Smart Stitch. Run: pip install Pillow")
 
+    # Sort by DOM index (reading order)
     sorted_items = sorted(
-        [(idx, url, data, ct) for idx, url, data, ct in results if data],
+        [(idx, data, ct) for idx, _url, data, ct in results if data],
         key=lambda x: x[0],
     )
-    pil_images: list[PILImage.Image] = []
-    for idx, url, data, ct in sorted_items:
-        if not _is_manhwa_panel(data, ct):
+
+    # Decode + dimension filter in one pass (no double-decode)
+    panels: list[tuple[PILImage.Image, int, int]] = []   # (img, w, h)
+    for idx, data, ct in sorted_items:
+        if "svg" in ct.lower():
             continue
         try:
             img = PILImage.open(io.BytesIO(data))
             img.load()
+            w, h = img.size
+            if w < MINIMUM_PANEL_WIDTH or h < MINIMUM_PANEL_HEIGHT:
+                log.debug(f"Stitch skip (too small): {w}×{h}")
+                continue
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            pil_images.append(img)
+            panels.append((img, w, h))
         except Exception as exc:
             log.debug(f"Stitch decode error: {exc}")
 
-    if not pil_images:
-        raise ValueError("No valid images to stitch after filtering.")
+    if not panels:
+        raise ValueError("No valid panels to stitch after filtering.")
 
-    widths   = [img.size[0] for img in pil_images]
+    # Pick target width = most common panel width
+    widths   = [w for _, w, _ in panels]
     target_w = max(set(widths), key=widths.count)
+    all_same_width = all(w == target_w for _, w, _ in panels)
 
-    scaled: list[PILImage.Image] = []
-    for img in pil_images:
-        if img.size[0] != target_w:
-            ratio = target_w / img.size[0]
-            new_h = max(1, int(img.size[1] * ratio))
-            img   = img.resize((target_w, new_h), PILImage.LANCZOS)
-        scaled.append(img)
+    # Pack into strips and encode strip-by-strip (saves RAM)
+    zip_buf      = io.BytesIO()
+    strip_index  = 0
+    strip_groups_meta: list[int] = []   # panel counts per strip
 
-    strip_groups: list[list[PILImage.Image]] = []
-    current: list[PILImage.Image] = []
+    current_imgs: list[PILImage.Image] = []
     current_h = 0
-    for img in scaled:
-        h = img.size[1]
-        if current and current_h + h > max_strip_height:
-            strip_groups.append(current)
-            current   = [img]
-            current_h = h
-        else:
-            current.append(img)
-            current_h += h
-    if current:
-        strip_groups.append(current)
 
-    zip_buf     = io.BytesIO()
-    strip_count = len(strip_groups)
-    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for i, group in enumerate(strip_groups, start=1):
-            total_h = sum(img.size[1] for img in group)
-            canvas  = PILImage.new("RGB", (target_w, total_h), (255, 255, 255))
-            y_off   = 0
-            for img in group:
-                canvas.paste(img, (0, y_off))
-                y_off += img.size[1]
-            img_buf = io.BytesIO()
-            canvas.save(img_buf, format="JPEG", quality=95, optimize=True)
-            img_buf.seek(0)
-            zf.writestr(f"strip_{i:03d}_of_{strip_count:03d}.jpg", img_buf.read())
-            log.info(f"Stitch: strip {i}/{strip_count} — {target_w}×{total_h} px, {len(group)} panels")
+    def _flush_strip(group: list[PILImage.Image], s_idx: int, total_strips_hint: int):
+        total_h = sum(img.size[1] for img in group)
+        canvas  = PILImage.new("RGB", (target_w, total_h))
+        y = 0
+        for img in group:
+            # Resize only if needed (BILINEAR is 4× faster than LANCZOS)
+            if img.size[0] != target_w:
+                ratio = target_w / img.size[0]
+                new_h = max(1, int(img.size[1] * ratio))
+                img   = img.resize((target_w, new_h), PILImage.BILINEAR)
+            canvas.paste(img, (0, y))
+            y += img.size[1]
+        img_buf = io.BytesIO()
+        # quality=85 is visually indistinguishable and ~40% faster than 95
+        canvas.save(img_buf, format="JPEG", quality=85, optimize=False)
+        img_buf.seek(0)
+        return img_buf
+
+    # We won't know total strips until we finish, so write to a temp list first
+    strip_bufs: list[io.BytesIO] = []
+
+    for img, w, h in panels:
+        if current_imgs and current_h + h > max_strip_height:
+            strip_bufs.append(_flush_strip(current_imgs, len(strip_bufs), 0))
+            current_imgs = [img]
+            current_h    = h
+        else:
+            current_imgs.append(img)
+            current_h   += h
+
+    if current_imgs:
+        strip_bufs.append(_flush_strip(current_imgs, len(strip_bufs), 0))
+
+    strip_count = len(strip_bufs)
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        for i, sbuf in enumerate(strip_bufs, start=1):
+            name = f"strip_{i:03d}_of_{strip_count:03d}.jpg"
+            zf.writestr(name, sbuf.read())
+            log.info(f"Stitch: packed strip {i}/{strip_count}")
 
     zip_buf.seek(0)
     return zip_buf, strip_count
@@ -486,17 +549,15 @@ async def download_images(
         result_embed.add_field(name="📦 ZIP Size",          value=f"{zip_size/1024/1024:.2f} MB",  inline=True)
         if type_filter:
             result_embed.add_field(name="🔍 Filter", value=type_filter, inline=True)
-        result_embed.set_footer(text="Panels stitched at JPEG quality 95 · 15 000 px max strip height")
+        result_embed.set_footer(text="Panels stitched at JPEG quality 85 · 15 000 px max strip height · split at 10 MB")
         await progress_msg.edit(embed=result_embed)
 
-        # Split the stitch ZIP if it somehow exceeds the limit
-        zip_parts = await asyncio.to_thread(_split_zip, results) if zip_size > DISCORD_SIZE_LIMIT else [(zip_buf, strip_count)]
-        files = [
-            discord.File(buf, filename=f"stitched_part{i+1}.zip" if len(zip_parts) > 1 else "stitched.zip")
-            for i, (buf, _) in enumerate(zip_parts)
-        ]
-        for i in range(0, len(files), 10):
-            await interaction.followup.send(files=files[i:i+10])
+        # Split the stitch ZIP by strip (not by raw images) and send each part
+        stitch_parts = await asyncio.to_thread(_split_stitch_zip, zip_buf)
+        n = len(stitch_parts)
+        for i, part_buf in enumerate(stitch_parts):
+            fname = f"stitched_part{i+1:02d}_of_{n:02d}.zip" if n > 1 else "stitched.zip"
+            await interaction.followup.send(file=discord.File(part_buf, filename=fname))
         return
 
     # ══════════════════════════════════════════════════════════════════════════
