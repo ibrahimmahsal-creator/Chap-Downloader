@@ -26,6 +26,14 @@ try:
 except ImportError:
     GDRIVE_AVAILABLE = False
 
+# ─── Pillow (optional — used for dimension-based manhwa filter) ───────────────
+try:
+    from PIL import Image as PILImage
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    log.warning("Pillow not installed — dimension filter disabled. Run: pip install Pillow")
+
 # ─── Logging Setup ────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +54,48 @@ DOWNLOAD_TIMEOUT    = aiohttp.ClientTimeout(total=20, connect=8)
 DISCORD_SIZE_LIMIT  = 10 * 1024 * 1024   # 10 MB
 MIN_IMAGE_BYTES     = 512
 SUPPORTED_EXTS      = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.avif'}
+
+# ─── Manhwa Panel Filter Constants ───────────────────────────────────────────
+# URL path fragments that indicate UI/decoration assets — never manhwa panels
+_UI_SKIP_WORDS = {
+    "logo", "icon", "favicon", "avatar", "banner", "sprite", "button",
+    "arrow", "loading", "spinner", "placeholder", "blank", "pixel",
+    "tracking", "ads", "badge", "rating", "star",
+    "social", "share", "facebook", "twitter", "discord", "patreon",
+    "header", "footer", "nav", "menu", "sidebar", "widget",
+    "bg", "background", "pattern", "texture", "watermark",
+}
+
+# HTML block-level tags whose contents are never manhwa chapter panels
+_UI_ANCESTORS = {"nav", "header", "footer", "aside", "button"}
+
+# Minimum width (px) a manhwa panel must have — filters icons / thumbnails
+MINIMUM_PANEL_WIDTH = 300
+
+
+def _is_ui_url(img_url: str) -> bool:
+    """Return True if the URL path contains a known UI/decoration keyword."""
+    path = urllib.parse.urlparse(img_url).path.lower()
+    tokens = set(re.split(r'[/_\-.]', path))
+    return bool(tokens & _UI_SKIP_WORDS)
+
+
+def _is_manhwa_panel(data: bytes, content_type: str) -> bool:
+    """
+    Return True only if the image is wide enough to be a manhwa chapter panel.
+    Requires Pillow; falls back to True (keep) if unavailable or unreadable.
+    SVGs are always kept — they have no raster dimensions.
+    """
+    if not PIL_AVAILABLE:
+        return True
+    if "svg" in content_type.lower():
+        return True
+    try:
+        img = PILImage.open(io.BytesIO(data))
+        w, h = img.size
+        return w >= MINIMUM_PANEL_WIDTH
+    except Exception:
+        return True   # can't read — keep it rather than silently drop
 
 # ─── Health-check web server (for Render) ─────────────────────────────────────
 class _Handler(BaseHTTPRequestHandler):
@@ -166,17 +216,29 @@ def _scrape_image_urls(url: str) -> tuple[list[str], dict, str]:
     # Use a dict as an ordered set — keys are URLs, insertion order = DOM order
     found: dict[str, None] = {}
 
-    def add(src: str):
+    def add(src: str, skip_ui_check: bool = False):
         if not src or src.startswith("data:"):
             return
         full = urllib.parse.urljoin(url, src.strip())
+        # ── Layer 1: URL keyword blacklist ──
+        if not skip_ui_check and _is_ui_url(full):
+            return
         parsed_path = urllib.parse.urlparse(full).path.lower()
         ext = os.path.splitext(parsed_path)[1]
         if ext == "" or ext in SUPPORTED_EXTS:
             found[full] = None   # preserves first-seen order, deduplicates
 
-    # 1. <img src / data-src / data-original / data-lazy-src / data-srcset>
+    def _in_ui_ancestor(tag) -> bool:
+        """Return True if any ancestor tag is a navigation/layout element."""
+        for parent in tag.parents:
+            if getattr(parent, "name", None) in _UI_ANCESTORS:
+                return True
+        return False
+
+    # 1. <img> tags — skip those inside nav/header/footer/aside (Layer 2: DOM context)
     for img in soup.find_all("img"):
+        if _in_ui_ancestor(img):
+            continue
         for attr in ("src", "data-src", "data-original", "data-lazy-src", "data-url"):
             add(img.get(attr, ""))
         srcset = img.get("srcset", "")
@@ -184,33 +246,16 @@ def _scrape_image_urls(url: str) -> tuple[list[str], dict, str]:
             for part in srcset.split(","):
                 add(part.strip().split()[0])
 
-    # 2. <source srcset> inside <picture>
+    # 2. <source srcset> inside <picture> — only if not in a UI ancestor
     for source in soup.find_all("source"):
+        if _in_ui_ancestor(source):
+            continue
         srcset = source.get("srcset", "")
         for part in srcset.split(","):
             add(part.strip().split()[0])
 
-    # 3. Inline CSS background-image
-    for tag in soup.find_all(style=True):
-        for u in re.findall(r'url\([\'"]?(.*?)[\'"]?\)', tag["style"]):
-            add(u)
-
-    # 4. <style> blocks
-    for style_tag in soup.find_all("style"):
-        if style_tag.string:
-            for u in re.findall(r'url\([\'"]?(.*?)[\'"]?\)', style_tag.string):
-                add(u)
-
-    # 5. Open Graph / Twitter card meta images
-    for meta in soup.find_all("meta"):
-        prop = meta.get("property", "") or meta.get("name", "")
-        if "image" in prop.lower():
-            add(meta.get("content", ""))
-
-    # 6. <link rel="icon"> / apple-touch-icon
-    for link in soup.find_all("link", rel=True):
-        if any("icon" in r for r in link.get("rel", [])):
-            add(link.get("href", ""))
+    # NOTE: CSS backgrounds, <style> blocks, Open Graph meta, and favicon links
+    # are intentionally excluded — they are never manhwa chapter panel images.
 
     ua = scraper.headers.get("User-Agent") or "Mozilla/5.0"
     cookies = scraper.cookies.get_dict()
@@ -264,6 +309,10 @@ def _build_zip(results, zip_compression=zipfile.ZIP_DEFLATED) -> tuple[io.BytesI
     with zipfile.ZipFile(buf, "w", compression=zip_compression, compresslevel=6) as zf:
         for index, img_url, content, content_type in results:
             if not content:
+                continue
+            # ── Layer 3: Dimension filter — reject images too narrow to be panels ──
+            if not _is_manhwa_panel(content, content_type):
+                log.debug(f"Skipped (too small): {img_url}")
                 continue
             ext = _ext_from_content_type(content_type, img_url)
             raw_name = os.path.basename(urllib.parse.urlparse(img_url).path)
